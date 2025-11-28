@@ -42,6 +42,7 @@ from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import timeutils
 import requests
+import httpx
 
 from cinder.backup import chunkeddriver
 from cinder import exception
@@ -205,7 +206,8 @@ class PBSClient:
         self.base_url = f"https://{host}:{port}"
         self.ticket = None
         self.csrf_token = None
-        self.session = requests.Session()
+        # Disable verify for now if configured, but ideally use a context
+        self.session = httpx.Client(http2=True, verify=verify_ssl, timeout=60.0)
         
     def _build_url(self, path):
         """Build full URL for API endpoint."""
@@ -221,11 +223,7 @@ class PBSClient:
         }
         
         try:
-            response = self.session.post(
-                auth_url,
-                data=data,
-                verify=self.verify_ssl
-            )
+            response = self.session.post(auth_url, data=data)
             response.raise_for_status()
             
             result = response.json()
@@ -238,7 +236,7 @@ class PBSClient:
             
             LOG.debug("Successfully authenticated to PBS server")
             
-        except requests.exceptions.RequestException as e:
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
             msg = _("Failed to authenticate to PBS: %s") % str(e)
             raise exception.BackupDriverException(msg)
             
@@ -284,15 +282,25 @@ class PBSClient:
             'backup-time': backup_time,
         }
         
-    def upload_chunk(self, digest, data):
+    def upload_chunk(self, datastore, digest, data):
         """Upload a chunk to PBS.
         
+        :param datastore: Datastore name
         :param digest: SHA256 digest of the chunk
         :param data: Chunk data (should be PBS blob encoded)
         """
-        # This would use HTTP/2 POST to /fixed_chunk or /dynamic_chunk
-        # Simplified for now
-        LOG.debug(f"Would upload chunk with digest {digest}")
+        url = self._build_url("/fixed_chunk")
+        headers = self._get_headers()
+        headers['Content-Type'] = 'application/octet-stream'
+        headers['Upload-Image-Store'] = datastore
+        headers['Upload-Chunk-Digest'] = digest
+        
+        try:
+            response = self.session.post(url, content=data, headers=headers)
+            response.raise_for_status()
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            msg = _("Failed to upload chunk to PBS: %s") % str(e)
+            raise exception.BackupDriverException(msg)
         
     def upload_fixed_index(self, name, chunks):
         """Upload a fixed index file.
@@ -308,15 +316,26 @@ class PBSClient:
         # This would call POST /finish
         LOG.debug("Would finish backup")
         
-    def download_chunk(self, digest):
+    def download_chunk(self, datastore, digest):
         """Download a chunk from PBS.
         
+        :param datastore: Datastore name
         :param digest: SHA256 digest of the chunk
         :returns: Chunk data (PBS blob encoded)
         """
-        # This would use HTTP/2 GET /chunk
-        LOG.debug(f"Would download chunk with digest {digest}")
-        return b''
+        url = self._build_url("/fixed_chunk")
+        headers = self._get_headers()
+        headers['Upload-Image-Store'] = datastore
+        headers['Upload-Chunk-Digest'] = digest
+        
+        try:
+            # Assuming GET request with headers for download
+            response = self.session.get(url, headers=headers)
+            response.raise_for_status()
+            return response.content
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            msg = _("Failed to download chunk from PBS: %s") % str(e)
+            raise exception.BackupDriverException(msg)
         
     def download_index(self, name):
         """Download an index file.
@@ -332,14 +351,16 @@ class PBSClient:
 class ObjectWriter:
     """Writer for PBS objects (chunks/blobs)."""
     
-    def __init__(self, client, name, compress=False):
+    def __init__(self, client, datastore, name, compress=False):
         """Initialize writer.
         
         :param client: PBSClient instance
+        :param datastore: Datastore name
         :param name: Object name
         :param compress: Whether to compress data
         """
         self.client = client
+        self.datastore = datastore
         self.name = name
         self.blob_handler = PBSDataBlob(compress=compress)
         self.buffer = io.BytesIO()
@@ -367,26 +388,28 @@ class ObjectWriter:
         digest = hashlib.sha256(data).hexdigest()
         
         # Upload to PBS
-        self.client.upload_chunk(digest, blob)
+        self.client.upload_chunk(self.datastore, digest, blob)
 
 
 class ObjectReader:
     """Reader for PBS objects (chunks/blobs)."""
     
-    def __init__(self, client, name):
+    def __init__(self, client, datastore, name):
         """Initialize reader.
         
         :param client: PBSClient instance
+        :param datastore: Datastore name
         :param name: Object name
         """
         self.client = client
+        self.datastore = datastore
         self.name = name
         self.blob_handler = PBSDataBlob()
         self.data = None
         
     def __enter__(self):
         # Download and decode the blob
-        blob = self.client.download_chunk(self.name)
+        blob = self.client.download_chunk(self.datastore, self.name)
         self.data = self.blob_handler.decode(blob)
         return self
         
@@ -406,17 +429,16 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     relying on the proxmox-backup-client command-line tool.
     """
     
-    def __init__(self, context, db=None):
+    def __init__(self, context):
         """Initialize the Proxmox Backup driver.
-        
+
         :param context: The security context
-        :param db: Database connection
         """
         chunk_size = CONF.backup_proxmox_chunk_size
         sha_block_size = CONF.backup_proxmox_block_size
         backup_default_container = CONF.backup_proxmox_datastore
         enable_progress_timer = CONF.backup_proxmox_enable_progress_timer
-        
+
         super(ProxmoxBackupDriver, self).__init__(
             context,
             chunk_size,
@@ -424,8 +446,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             backup_default_container,
             enable_progress_timer,
         )
-        
-        self.db = db
+
         self._validate_config()
         
     def _validate_config(self):
@@ -484,7 +505,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         """
         client = self._get_client()
         compress = CONF.backup_compression_algorithm not in ('none', 'off', 'no')
-        return ObjectWriter(client, object_name, compress=compress)
+        return ObjectWriter(client, container, object_name, compress=compress)
         
     def get_object_reader(self, container, object_name, extra_metadata=None):
         """Get a reader for downloading an object.
@@ -495,7 +516,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         :returns: ObjectReader instance
         """
         client = self._get_client()
-        return ObjectReader(client, object_name)
+        return ObjectReader(client, container, object_name)
         
     def delete_object(self, container, object_name):
         """Delete an object from PBS.
