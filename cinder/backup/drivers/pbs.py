@@ -100,40 +100,83 @@ CONF = cfg.CONF
 CONF.register_opts(proxmoxbackup_service_opts)
 
 
-class PBSChunk:
-    """Handler for Proxmox Backup Server chunk data.
+class PBSDataBlob:
+    """Handler for Proxmox Backup Server data blob encoding/decoding.
 
-    For fixed index, chunks are stored as raw data without blob wrapping.
-    The chunk digest is calculated from the raw chunk data itself.
-    Reference: https://pbs.proxmox.com/docs/file-formats.html#fixed-index-format
+    PBS stores data in a specific blob format with magic numbers and CRC checks.
+    This class implements the encoding and decoding logic.
     """
 
-    def __init__(self):
-        """Initialize chunk handler for fixed index."""
-        pass
+    # Magic numbers for different blob types
+    # https://pbs.proxmox.com/docs/file-formats.html#data-blob-format
+    # [66, 171, 56, 7, 190, 131, 112, 161] -> 0xA17083BE0738AB42 (Little Endian)
+    UNENCRYPTED_UNCOMPRESSED_BLOB_MAGIC_1_0 = 0xA17083BE0738AB42
+    UNENCRYPTED_COMPRESSED_BLOB_MAGIC_1_0 = 0x0107_5670_ac7a_c807
+
+    def __init__(self, compress=False, encrypt=False):
+        """Initialize blob handler.
+
+        :param compress: Whether to compress the data
+        :param encrypt: Whether to encrypt the data (not yet implemented)
+        """
+        self.compress = compress
+        self.encrypt = encrypt
 
     def encode(self, data):
-        """Prepare chunk data for fixed index.
+        """Encode data into PBS blob format.
 
-        For fixed index, chunks are stored as raw data.
-        No blob format wrapping is needed.
-
-        :param data: Raw bytes to store
-        :returns: Raw chunk data
+        :param data: Raw bytes to encode
+        :returns: Encoded blob bytes
         """
-        # Fixed index stores raw chunk data directly
-        return data
+        if self.encrypt:
+            raise NotImplementedError("Encryption not yet implemented")
 
-    def decode(self, chunk_data):
-        """Decode chunk data from fixed index.
+        # Determine magic number based on compression
+        if self.compress:
+            compressed = zlib.compress(data)
+            magic = self.UNENCRYPTED_COMPRESSED_BLOB_MAGIC_1_0
+            payload = compressed
+        else:
+            magic = self.UNENCRYPTED_UNCOMPRESSED_BLOB_MAGIC_1_0
+            payload = data
 
-        For fixed index, chunks are stored as raw data.
+        # Calculate CRC32
+        crc = struct.unpack('<I', struct.pack('<I', 0xffffffff ^
+                                              zlib.crc32(payload) ^ 0xffffffff))[0]
 
-        :param chunk_data: Raw chunk bytes
+        # Build blob: magic(8) + crc(4) + data
+        blob = struct.pack('<Q', magic) + struct.pack('<I', crc) + payload
+
+        return blob
+
+    def decode(self, blob):
+        """Decode PBS blob format to raw data.
+
+        :param blob: Blob bytes to decode
         :returns: Decoded raw bytes
         """
-        # Fixed index stores raw chunk data directly
-        return chunk_data
+        if len(blob) < 12:
+            raise ValueError("Blob too small")
+
+        # Parse header
+        magic = struct.unpack('<Q', blob[0:8])[0]
+        crc_expected = struct.unpack('<I', blob[8:12])[0]
+        payload = blob[12:]
+
+        # Verify CRC
+        crc_actual = struct.unpack('<I', struct.pack('<I', 0xffffffff ^
+                                                     zlib.crc32(payload) ^ 0xffffffff))[0]
+        if crc_actual != crc_expected:
+            raise ValueError(f"CRC mismatch: expected {crc_expected}, "
+                             f"got {crc_actual}")
+
+        # Decompress if needed
+        if magic == self.UNENCRYPTED_COMPRESSED_BLOB_MAGIC_1_0:
+            return zlib.decompress(payload)
+        elif magic == self.UNENCRYPTED_UNCOMPRESSED_BLOB_MAGIC_1_0:
+            return payload
+        else:
+            raise ValueError(f"Unknown blob magic: {hex(magic)}")
 
 
 class PBSClient:
@@ -356,20 +399,21 @@ class PBSClient:
 
 
 class ObjectWriter:
-    """Writer for PBS objects (chunks) for fixed index."""
+    """Writer for PBS objects (chunks/blobs)."""
 
-    def __init__(self, client, datastore, name, state=None):
+    def __init__(self, client, datastore, name, compress=False, state=None):
         """Initialize writer.
 
         :param client: PBSClient instance
         :param datastore: Datastore name
         :param name: Object name
+        :param compress: Whether to compress data
         :param state: Shared state dict for the backup session
         """
         self.client = client
         self.datastore = datastore
         self.name = name
-        self.chunk_handler = PBSChunk()
+        self.blob_handler = PBSDataBlob(compress=compress)
         self.buffer = io.BytesIO()
         self.state = state
 
@@ -386,38 +430,35 @@ class ObjectWriter:
         self.buffer.write(data)
 
     def close(self):
-        """Finalize and upload the chunk."""
+        """Finalize and upload the object."""
         data = self.buffer.getvalue()
-        chunk_size = len(data)
+        original_size = len(data)
 
-        # For fixed index, chunk data is stored as-is (no blob wrapping)
-        chunk_data = self.chunk_handler.encode(data)
+        # Encode as PBS blob
+        blob = self.blob_handler.encode(data)
 
-        # Calculate digest from the raw chunk data
-        # This digest is used in the fixed index file format
-        digest = hashlib.sha256(chunk_data).hexdigest()
+        # Calculate digest of the raw data (not the blob)
+        digest = hashlib.sha256(data).hexdigest()
 
         # Upload to PBS
         if self.state is not None:
             wid = self.state['wid']
 
-            # Upload chunk (for fixed index, size and encoded_size are the same)
+            # Upload chunk
             self.client.upload_chunk(
-                wid, chunk_data, chunk_size, chunk_size, digest)
+                wid, blob, original_size, len(blob), digest)
 
             # Track for appending to index
             self.state['digests'].append(digest)
             self.state['offsets'].append(self.state['current_offset'])
 
             # Update offset and stats
-            self.state['current_offset'] += chunk_size
+            self.state['current_offset'] += original_size
             self.state['chunk_count'] += 1
-            self.state['total_size'] += chunk_size
+            self.state['total_size'] += original_size
 
-            # Update index_csum: SHA256(digest1||digest2||...)
-            # Convert hex digest to bytes and update running hash
-            digest_bytes = bytes.fromhex(digest)
-            self.state['csum'].update(digest_bytes)
+            # Update checksum (SHA256 of concatenated data)
+            self.state['csum'].update(data)
 
 
 class ObjectReader:
@@ -613,8 +654,10 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             raise exception.BackupDriverException(
                 "No active PBS session for backup")
 
-        # For fixed index, chunks are stored as raw data
-        return ObjectWriter(client, container, object_name, state=state)
+        # Disable compression in PBSDataBlob if Cinder is already compressing
+        return ObjectWriter(client, container, object_name,
+                            compress=False,
+                            state=state)
 
     def get_object_reader(self, container, object_name, extra_metadata=None):
         """Get a reader for downloading an object."""
