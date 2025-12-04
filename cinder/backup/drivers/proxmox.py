@@ -229,7 +229,9 @@ class PBSClient:
         try:
             # We use the existing session which should be HTTP/2 enabled
             response = self.session.get(url, params=params, headers=headers)
-            response.raise_for_status()
+            # HTTP 101 Switching Protocols is expected and means success
+            if response.status_code != 101:
+                response.raise_for_status()
             LOG.info(
                 f"Started PBS backup session for {backup_type}/{backup_id}")
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
