@@ -246,20 +246,29 @@ class PBSClient:
         :returns: Writer ID (wid)
         """
         path = "/fixed_index"
-        params = {
+
+        url = self._build_url(path)
+        headers = self._get_headers()
+        headers['Content-Type'] = 'application/json'
+
+        data = {
             'archive-name': archive_name,
             'size': size,
         }
 
-        url = self._build_url(path)
-        headers = self._get_headers()
-
         try:
-            response = self.session.post(url, params=params, headers=headers)
+            response = self.session.post(url, headers=headers, json=data)
             response.raise_for_status()
-            return int(response.json())
+            return int(response.text)
         except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
-            msg = _("Failed to create fixed index for archive: %s") % str(e)
+            error_detail = ""
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_detail = f" - Response: {e.response.text}"
+                except:
+                    pass
+            msg = ("Failed to create fixed index for archive: %s%s") % (
+                str(e), error_detail)
             raise exception.BackupDriverException(msg)
 
     def upload_chunk(self, wid, chunk_data, size, encoded_size, digest):
