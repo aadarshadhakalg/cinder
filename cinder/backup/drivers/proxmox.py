@@ -159,9 +159,9 @@ class PBSClient:
         self.base_url = f"https://{host}:{port}"
         self.ticket = None
         self.csrf_token = None
-        # Separate sessions for API and backup protocol
-        self.api_session = httpx.Client(verify=verify_ssl, timeout=60.0)
-        self.h2_session = None  # Will be created after upgrade
+        # Single HTTP/2 enabled session for all requests
+        self.session = httpx.Client(
+            http2=True, verify=verify_ssl, timeout=60.0)
 
     def _build_url(self, path):
         """Build full URL for API endpoint."""
@@ -177,7 +177,7 @@ class PBSClient:
         }
 
         try:
-            response = self.api_session.post(auth_url, data=data)
+            response = self.session.post(auth_url, data=data)
             response.raise_for_status()
 
             result = response.json()
@@ -227,16 +227,10 @@ class PBSClient:
         headers['Upgrade'] = 'proxmox-backup-protocol-v1'
 
         try:
-            # Use API session for the upgrade request
-            response = self.api_session.get(
-                url, params=params, headers=headers)
+            response = self.session.get(url, params=params, headers=headers)
             # HTTP 101 Switching Protocols is expected and means success
             if response.status_code != 101:
                 response.raise_for_status()
-
-            # After successful upgrade, create H2 session for backup protocol
-            self.h2_session = httpx.Client(
-                http2=True, verify=self.verify_ssl, timeout=60.0)
 
             LOG.info(
                 f"Started PBS backup session for {backup_type}/{backup_id}")
@@ -261,9 +255,7 @@ class PBSClient:
         headers = self._get_headers()
 
         try:
-            # Use H2 session for backup protocol requests
-            session = self.h2_session if self.h2_session else self.api_session
-            response = session.post(url, params=params, headers=headers)
+            response = self.session.post(url, params=params, headers=headers)
             response.raise_for_status()
             # Response should be a plain integer (wid)
             return int(response.text)
@@ -300,9 +292,7 @@ class PBSClient:
         headers['Content-Type'] = 'application/octet-stream'
 
         try:
-            # Use H2 session for backup protocol requests
-            session = self.h2_session if self.h2_session else self.api_session
-            response = session.post(
+            response = self.session.post(
                 url, params=params, headers=headers, content=chunk_data)
             response.raise_for_status()
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
@@ -327,9 +317,7 @@ class PBSClient:
         headers = self._get_headers()
 
         try:
-            # Use H2 session for backup protocol requests
-            session = self.h2_session if self.h2_session else self.api_session
-            response = session.put(url, params=params, headers=headers)
+            response = self.session.put(url, params=params, headers=headers)
             response.raise_for_status()
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             msg = _("Failed to append to fixed index: %s") % str(e)
@@ -355,9 +343,7 @@ class PBSClient:
         headers = self._get_headers()
 
         try:
-            # Use H2 session for backup protocol requests
-            session = self.h2_session if self.h2_session else self.api_session
-            response = session.post(url, params=params, headers=headers)
+            response = self.session.post(url, params=params, headers=headers)
             response.raise_for_status()
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             msg = _("Failed to close fixed index: %s") % str(e)
@@ -371,9 +357,7 @@ class PBSClient:
         headers = self._get_headers()
 
         try:
-            # Use H2 session for backup protocol requests
-            session = self.h2_session if self.h2_session else self.api_session
-            response = session.post(url, headers=headers)
+            response = self.session.post(url, headers=headers)
             response.raise_for_status()
             LOG.info("Completed PBS backup session")
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
@@ -482,13 +466,13 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     """Backup driver for Proxmox Backup Server.
 
     This driver implements native PBS protocol communication without
-    relying on the proxmox-backup-client command-line tool.
+    relying on the proxmox - backup - client command - line tool.
     """
 
     def __init__(self, context):
         """Initialize the Proxmox Backup driver.
 
-        :param context: The security context
+        : param context: The security context
         """
         chunk_size = CONF.backup_proxmox_chunk_size
         sha_block_size = CONF.backup_proxmox_block_size
@@ -609,9 +593,9 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                     del self._backup_state[backup.id]
 
     def put_container(self, container):
-        """Create the datastore/namespace if needed.
+        """Create the datastore / namespace if needed.
 
-        :param container: Container name (datastore)
+        : param container: Container name(datastore)
         """
         # In PBS, datastores are pre-created via admin interface
         # Namespaces can be created via API if needed
@@ -620,9 +604,9 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     def get_container_entries(self, container, prefix):
         """Get backup entries in the datastore.
 
-        :param container: Container name (datastore)
-        :param prefix: Prefix for filtering backups
-        :returns: List of backup names
+        : param container: Container name(datastore)
+        : param prefix: Prefix for filtering backups
+        : returns: List of backup names
         """
         # Would query PBS API for backup snapshots
         # For now, return empty list
@@ -632,8 +616,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     def _generate_object_name_prefix(self, backup):
         """Generate object name prefix for backup.
 
-        :param backup: Backup object
-        :returns: Object name prefix
+        : param backup: Backup object
+        : returns: Object name prefix
         """
         # Use backup ID as prefix for PBS backup objects
         return f"backup_{backup.id}_"
@@ -641,8 +625,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     def delete_object(self, container, object_name):
         """Delete object from container.
 
-        :param container: Container name (datastore)
-        :param object_name: Object name to delete
+        : param container: Container name(datastore)
+        : param object_name: Object name to delete
         """
         # For PBS, objects are managed as part of backup snapshots
         # Individual chunk deletion is handled by PBS garbage collection
@@ -671,9 +655,9 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     def update_container_name(self, backup, container):
         """Update container name if needed.
 
-        :param backup: Backup object
-        :param container: Proposed container name
-        :returns: Updated container name or None
+        : param backup: Backup object
+        : param container: Proposed container name
+        : returns: Updated container name or None
         """
         # Use configured datastore
         return CONF.backup_proxmox_datastore
@@ -710,7 +694,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 def get_backup_driver(context):
     """Return a Proxmox Backup driver instance.
 
-    :param context: Security context
-    :returns: ProxmoxBackupDriver instance
+    : param context: Security context
+    : returns: ProxmoxBackupDriver instance
     """
     return ProxmoxBackupDriver(context)
