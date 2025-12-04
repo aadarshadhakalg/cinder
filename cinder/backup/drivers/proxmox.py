@@ -245,7 +245,7 @@ class PBSClient:
         :param size: Total size of the archive
         :returns: Writer ID (wid)
         """
-        path = "/api2/json/fixed_index"
+        path = "/fixed_index"
         params = {
             'archive-name': archive_name,
             'size': size,
@@ -271,7 +271,7 @@ class PBSClient:
         :param encoded_size: Size of the encoded blob
         :param digest: SHA256 digest of the chunk
         """
-        path = "/api2/json/fixed_chunk"
+        path = "/fixed_chunk"
         params = {
             'wid': wid,
             'size': size,
@@ -298,7 +298,7 @@ class PBSClient:
         :param offset_list: JSON array of chunk offsets
         :param wid: Writer ID
         """
-        path = "/api2/json/fixed_index"
+        path = "/fixed_index"
         params = {
             'digest-list': digest_list,
             'offset-list': offset_list,
@@ -323,7 +323,7 @@ class PBSClient:
         :param size: Total size of data
         :param wid: Writer ID
         """
-        path = "/api2/json/fixed_close"
+        path = "/fixed_close"
         params = {
             'chunk-count': chunk_count,
             'csum': csum,
@@ -343,7 +343,7 @@ class PBSClient:
 
     def complete_backup(self):
         """Mark backup as complete."""
-        path = "/api2/json/finish"
+        path = "/finish"
 
         url = self._build_url(path)
         headers = self._get_headers()
