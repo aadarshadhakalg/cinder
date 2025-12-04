@@ -245,7 +245,7 @@ class PBSClient:
         :param size: Total size of the archive
         :returns: Writer ID (wid)
         """
-        path = "/fixed_index"
+        path = "fixed_index"
         params = {
             'archive-name': archive_name,
             'size': size,
