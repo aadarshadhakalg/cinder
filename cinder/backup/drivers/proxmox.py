@@ -1,17 +1,17 @@
 # Copyright (C) 2025 Aadarsha Dhakal <aadarsha.dhakal@startsml.com>
 # All Rights Reserved.
 #
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
 #
-#         http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
 
 """Implementation of a backup service using Proxmox Backup Server (PBS)
 
@@ -602,6 +602,27 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         # For now, return empty list
         LOG.debug(f"Listing backups in {container} with prefix {prefix}")
         return []
+
+    def _generate_object_name_prefix(self, backup):
+        """Generate object name prefix for backup.
+
+        :param backup: Backup object
+        :returns: Object name prefix
+        """
+        # Use backup ID as prefix for PBS backup objects
+        return f"backup_{backup.id}_"
+
+    def delete_object(self, container, object_name):
+        """Delete object from container.
+
+        :param container: Container name (datastore)
+        :param object_name: Object name to delete
+        """
+        # For PBS, objects are managed as part of backup snapshots
+        # Individual chunk deletion is handled by PBS garbage collection
+        LOG.debug(f"Delete object {object_name} from {container}")
+        # TODO: Implement snapshot deletion via PBS API if needed
+        pass
 
     def get_object_writer(self, container, object_name, extra_metadata=None):
         """Get a writer for uploading an object."""
