@@ -246,19 +246,18 @@ class PBSClient:
         :returns: Writer ID (wid)
         """
         path = "/fixed_index"
-
-        url = self._build_url(path)
-        headers = self._get_headers()
-        headers['Content-Type'] = 'application/json'
-
-        data = {
+        params = {
             'archive-name': archive_name,
             'size': size,
         }
 
+        url = self._build_url(path)
+        headers = self._get_headers()
+
         try:
-            response = self.session.post(url, headers=headers, json=data)
+            response = self.session.post(url, params=params, headers=headers)
             response.raise_for_status()
+            # Response should be a plain integer (wid)
             return int(response.text)
         except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
             error_detail = ""
@@ -293,7 +292,7 @@ class PBSClient:
         headers['Content-Type'] = 'application/octet-stream'
 
         try:
-            response = self.session.put(
+            response = self.session.post(
                 url, params=params, headers=headers, content=chunk_data)
             response.raise_for_status()
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
