@@ -159,9 +159,9 @@ class PBSClient:
         self.base_url = f"https://{host}:{port}"
         self.ticket = None
         self.csrf_token = None
-        # Disable verify for now if configured, but ideally use a context
-        self.session = httpx.Client(
-            http2=True, verify=verify_ssl, timeout=60.0)
+        # Separate sessions for API and backup protocol
+        self.api_session = httpx.Client(verify=verify_ssl, timeout=60.0)
+        self.h2_session = None  # Will be created after upgrade
 
     def _build_url(self, path):
         """Build full URL for API endpoint."""
@@ -177,7 +177,7 @@ class PBSClient:
         }
 
         try:
-            response = self.session.post(auth_url, data=data)
+            response = self.api_session.post(auth_url, data=data)
             response.raise_for_status()
 
             result = response.json()
@@ -205,7 +205,7 @@ class PBSClient:
         }
 
     def create_backup(self, datastore, backup_type, backup_id, backup_time):
-        """Start a backup session.
+        """Start a backup session and upgrade to HTTP/2 backup protocol.
 
         :param datastore: Datastore name
         :param backup_type: Backup type (e.g., 'host')
@@ -227,11 +227,17 @@ class PBSClient:
         headers['Upgrade'] = 'proxmox-backup-protocol-v1'
 
         try:
-            # We use the existing session which should be HTTP/2 enabled
-            response = self.session.get(url, params=params, headers=headers)
+            # Use API session for the upgrade request
+            response = self.api_session.get(
+                url, params=params, headers=headers)
             # HTTP 101 Switching Protocols is expected and means success
             if response.status_code != 101:
                 response.raise_for_status()
+
+            # After successful upgrade, create H2 session for backup protocol
+            self.h2_session = httpx.Client(
+                http2=True, verify=self.verify_ssl, timeout=60.0)
+
             LOG.info(
                 f"Started PBS backup session for {backup_type}/{backup_id}")
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
@@ -245,7 +251,7 @@ class PBSClient:
         :param size: Total size of the archive
         :returns: Writer ID (wid)
         """
-        path = "/api2/json/fixed_index"
+        path = "/fixed_index"
         params = {
             'archive-name': archive_name,
             'size': size,
@@ -255,7 +261,9 @@ class PBSClient:
         headers = self._get_headers()
 
         try:
-            response = self.session.post(url, params=params, headers=headers)
+            # Use H2 session for backup protocol requests
+            session = self.h2_session if self.h2_session else self.api_session
+            response = session.post(url, params=params, headers=headers)
             response.raise_for_status()
             # Response should be a plain integer (wid)
             return int(response.text)
@@ -279,7 +287,7 @@ class PBSClient:
         :param encoded_size: Size of the encoded blob
         :param digest: SHA256 digest of the chunk
         """
-        path = "/api2/json/fixed_chunk"
+        path = "/fixed_chunk"
         params = {
             'wid': wid,
             'size': size,
@@ -292,7 +300,9 @@ class PBSClient:
         headers['Content-Type'] = 'application/octet-stream'
 
         try:
-            response = self.session.post(
+            # Use H2 session for backup protocol requests
+            session = self.h2_session if self.h2_session else self.api_session
+            response = session.post(
                 url, params=params, headers=headers, content=chunk_data)
             response.raise_for_status()
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
@@ -306,7 +316,7 @@ class PBSClient:
         :param offset_list: JSON array of chunk offsets
         :param wid: Writer ID
         """
-        path = "/api2/json/fixed_index"
+        path = "/fixed_index"
         params = {
             'digest-list': digest_list,
             'offset-list': offset_list,
@@ -317,7 +327,9 @@ class PBSClient:
         headers = self._get_headers()
 
         try:
-            response = self.session.put(url, params=params, headers=headers)
+            # Use H2 session for backup protocol requests
+            session = self.h2_session if self.h2_session else self.api_session
+            response = session.put(url, params=params, headers=headers)
             response.raise_for_status()
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             msg = _("Failed to append to fixed index: %s") % str(e)
@@ -331,7 +343,7 @@ class PBSClient:
         :param size: Total size of data
         :param wid: Writer ID
         """
-        path = "/api2/json/fixed_close"
+        path = "/fixed_close"
         params = {
             'chunk-count': chunk_count,
             'csum': csum,
@@ -343,7 +355,9 @@ class PBSClient:
         headers = self._get_headers()
 
         try:
-            response = self.session.post(url, params=params, headers=headers)
+            # Use H2 session for backup protocol requests
+            session = self.h2_session if self.h2_session else self.api_session
+            response = session.post(url, params=params, headers=headers)
             response.raise_for_status()
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             msg = _("Failed to close fixed index: %s") % str(e)
@@ -351,13 +365,15 @@ class PBSClient:
 
     def complete_backup(self):
         """Mark backup as complete."""
-        path = "/api2/json/finish"
+        path = "/finish"
 
         url = self._build_url(path)
         headers = self._get_headers()
 
         try:
-            response = self.session.post(url, headers=headers)
+            # Use H2 session for backup protocol requests
+            session = self.h2_session if self.h2_session else self.api_session
+            response = session.post(url, headers=headers)
             response.raise_for_status()
             LOG.info("Completed PBS backup session")
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
