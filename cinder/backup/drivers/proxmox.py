@@ -224,7 +224,8 @@ class PBSClient:
         url = self._build_url(path)
         headers = self._get_headers()
         # Required to upgrade to backup protocol
-        headers['Upgrade'] = 'proxmox-backup-protocol-v1'
+        headers['Connection'] = 'upgrade'
+        headers['UPGRADE'] = 'proxmox-backup-protocol-v1'
 
         try:
             response = self.session.get(url, params=params, headers=headers)
@@ -232,6 +233,7 @@ class PBSClient:
             if response.status_code != 101:
                 response.raise_for_status()
 
+            LOG.debug(f"{response.http_version} backup session established")
             LOG.info(
                 f"Started PBS backup session for {backup_type}/{backup_id}")
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
