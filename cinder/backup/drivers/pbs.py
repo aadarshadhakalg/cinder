@@ -14,7 +14,7 @@ import ssl
 import socket
 from urllib.parse import urlparse
 from typing import Optional, List, Dict
-from oslo_config import cfg
+from oslo_config.cfg import StrOpt, IntOpt, CONF
 from oslo_log import log as logging
 from cinder.backup.driver import BackupDriver
 from cinder import exception
@@ -24,22 +24,22 @@ import httpx
 LOG = logging.getLogger(__name__)
 
 pbs_backup_opts = [
-    cfg.StrOpt('pbs_url', default='',
-               help='Url of Proxmox Backup Server (e.g. https://pbs:8007)'),
-    cfg.StrOpt('pbs_user', default='', help='User for PBS (e.g. root@pam)'),
-    cfg.StrOpt('pbs_password', default='', help='Password for PBS'),
-    cfg.StrOpt('pbs_datastore', default='', help='Datastore on PBS'),
-    cfg.StrOpt('pbs_fingerprint', default='',
-               help='SHA256 Fingerprint of the PBS Server'),
-    cfg.StrOpt('pbs_backup_type', default='vm',
-               help='Backup Type to use (defaults to vm)'),
-    cfg.IntOpt('pbs_chunk_size', default=4 * 1024 * 1024,
-               help='Chunk size in bytes (default 4MB)'),
-    cfg.IntOpt('pbs_upload_threads', default=4,
-               help='Number of threads for upload (not implemented yet, async used)'),
+    StrOpt('pbs_url', default='',
+           help='Url of Proxmox Backup Server (e.g. https://pbs:8007)'),
+    StrOpt('pbs_user', default='', help='User for PBS (e.g. root@pam)'),
+    StrOpt('pbs_password', default='', help='Password for PBS'),
+    StrOpt('pbs_datastore', default='', help='Datastore on PBS'),
+    StrOpt('pbs_fingerprint', default='',
+           help='SHA256 Fingerprint of the PBS Server'),
+    StrOpt('pbs_backup_type', default='vm',
+           help='Backup Type to use (defaults to vm)'),
+    IntOpt('pbs_chunk_size', default=4 * 1024 * 1024,
+           help='Chunk size in bytes (default 4MB)'),
+    IntOpt('pbs_upload_threads', default=4,
+           help='Number of threads for upload (not implemented yet, async used)'),
 ]
 
-cfg.CONF.register_opts(pbs_backup_opts)
+CONF.register_opts(pbs_backup_opts)
 
 
 # --- Embedded PBS Client Logic (Adapted from pbs_backup_python) ---
@@ -209,8 +209,16 @@ class BackupWriter:
             "store": self.client.datastore,
             "debug": True
         }
-        resp = self.client.client.get("/api2/json/backup", params=params)
-        resp.raise_for_status()
+        # PBS expects Upgrade header even on H2 sometimes or it's just part of the handshake check
+        headers = {
+            "Upgrade": "proxmox-backup-protocol-h2"
+        }
+        # We merge with client default headers which valid authentication
+        resp = self.client.client.get(
+            "/api2/json/backup", params=params, headers=headers)
+
+        if resp.status_code >= 400:
+            resp.raise_for_status()
 
     def create_fixed_index(self, archive_name: str):
         resp = self.client.client.post(
@@ -262,8 +270,14 @@ class BackupReader:
             "backup-time": self.backup_time,
             "store": self.client.datastore
         }
-        resp = self.client.client.get("/api2/json/reader", params=params)
-        resp.raise_for_status()
+        headers = {
+            "Upgrade": "proxmox-backup-protocol-h2"
+        }
+        resp = self.client.client.get(
+            "/api2/json/reader", params=params, headers=headers)
+
+        if resp.status_code >= 400:
+            resp.raise_for_status()
 
     def download_fixed_index(self, archive_name: str) -> List[bytes]:
         # GET /download using simple HTTP?
@@ -325,14 +339,14 @@ class PBSBackupDriver(BackupDriver):
 
     def __init__(self, context):
         super(PBSBackupDriver, self).__init__(context)
-        self.pbs_url = cfg.CONF.pbs_url
-        self.pbs_user = cfg.CONF.pbs_user
-        self.pbs_password = cfg.CONF.pbs_password
-        self.pbs_datastore = cfg.CONF.pbs_datastore
-        self.pbs_backup_type = cfg.CONF.pbs_backup_type
-        self.chunk_size = cfg.CONF.pbs_chunk_size
+        self.pbs_url = CONF.pbs_url
+        self.pbs_user = CONF.pbs_user
+        self.pbs_password = CONF.pbs_password
+        self.pbs_datastore = CONF.pbs_datastore
+        self.pbs_backup_type = CONF.pbs_backup_type
+        self.chunk_size = CONF.pbs_chunk_size
 
-        self.pbs_fingerprint = cfg.CONF.pbs_fingerprint
+        self.pbs_fingerprint = CONF.pbs_fingerprint
 
         if not all([self.pbs_url, self.pbs_user, self.pbs_password, self.pbs_datastore]):
             # In real cinder, might want to check this more gracefully or default
