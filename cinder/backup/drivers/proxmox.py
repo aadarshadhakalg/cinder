@@ -636,7 +636,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         client.authenticate()
 
         # Use 'host' type for generic data
-        backup_type = 'host'
+        backup_type = 'vm'
         backup_id = f"volume-{backup.volume_id}"
         # Use created_at timestamp for consistency
         if backup.created_at:
