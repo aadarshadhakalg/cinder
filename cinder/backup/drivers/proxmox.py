@@ -256,6 +256,7 @@ class PBSClient:
 
         try:
             response = self.session.post(url, params=params, headers=headers)
+            LOG.debug(f"Create fixed index response: {response.http_version}")
             response.raise_for_status()
             # Response should be a plain integer (wid)
             return int(response.text)
