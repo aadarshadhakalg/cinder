@@ -1,712 +1,422 @@
-# Copyright (C) 2025 Aadarsha Dhakal <aadarsha.dhakal@startsml.com>
-# All Rights Reserved.
-#
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
-#
-#         http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
-
-"""Implementation of a backup service using Proxmox Backup Server (PBS)
-
-**Related Flags**
-
-:backup_proxmox_host: The hostname or IP of the PBS server.
-:backup_proxmox_port: The port of the PBS server (default: 8007).
-:backup_proxmox_user: Username for PBS authentication (e.g., 'root@pam').
-:backup_proxmox_password: Password for PBS authentication.
-:backup_proxmox_datastore: The datastore name on PBS server.
-:backup_proxmox_namespace: Optional namespace within the datastore.
-:backup_proxmox_verify_ssl: Verify SSL certificates (default: True).
-:backup_proxmox_fingerprint: Optional SHA256 fingerprint of PBS server cert.
-:backup_proxmox_chunk_size: Size of backup chunks in bytes (default: 4MB).
+"""
+Cinder Backup Driver for Proxmox Backup Server (PBS).
 """
 
-import base64
-import hashlib
-import hmac
-import io
-import json
+import os
 import struct
-import time
 import zlib
-from urllib import parse as urlparse
-
+import hashlib
+import json
+import logging
+import math
+import time
+from typing import Optional, List, Dict
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import timeutils
-import requests
-import httpx
-
-from cinder.backup import chunkeddriver
+from cinder.backup.driver import BackupDriver
 from cinder import exception
 from cinder.i18n import _
-from cinder import interface
-from cinder.utils import retry
+import httpx
+
 
 LOG = logging.getLogger(__name__)
 
-proxmoxbackup_service_opts = [
-    cfg.StrOpt('backup_proxmox_host',
-               help='The hostname or IP address of the Proxmox Backup Server'),
-    cfg.PortOpt('backup_proxmox_port',
-                default=8007,
-                help='The port of the Proxmox Backup Server'),
-    cfg.StrOpt('backup_proxmox_user',
-               default='root@pam',
-               help='Username for Proxmox Backup Server authentication '
-                    '(e.g., root@pam)'),
-    cfg.StrOpt('backup_proxmox_password',
-               secret=True,
-               help='Password for Proxmox Backup Server authentication'),
-    cfg.StrOpt('backup_proxmox_datastore',
-               default='datastore1',
-               help='The datastore name on Proxmox Backup Server'),
-    cfg.StrOpt('backup_proxmox_namespace',
-               default='',
-               help='Optional namespace within the datastore'),
-    cfg.BoolOpt('backup_proxmox_verify_ssl',
-                default=True,
-                help='Verify SSL certificates when connecting to PBS'),
-    cfg.StrOpt('backup_proxmox_fingerprint',
-               default=None,
-               help='Optional SHA256 fingerprint of the PBS server '
-                    'certificate for additional security'),
-    cfg.IntOpt('backup_proxmox_chunk_size',
-               default=4 * 1024 * 1024,  # 4MB
-               help='The size in bytes of PBS backup chunks'),
-    cfg.IntOpt('backup_proxmox_block_size',
-               default=64 * 1024,  # 64KB
-               help='The size in bytes that changes are tracked '
-                    'for incremental backups'),
-    cfg.IntOpt('backup_proxmox_retry_attempts',
-               default=3,
-               help='The number of retries for PBS operations'),
-    cfg.IntOpt('backup_proxmox_retry_backoff',
-               default=2,
-               help='The backoff time in seconds between PBS retries'),
-    cfg.BoolOpt('backup_proxmox_enable_progress_timer',
-                default=True,
-                help='Enable progress notifications to Ceilometer'),
+pbs_backup_opts = [
+    StrOpt('pbs_url', default='',
+           help='Url of Proxmox Backup Server (e.g. https://pbs:8007)'),
+    StrOpt('pbs_user', default='', help='User for PBS (e.g. root@pam)'),
+    StrOpt('pbs_password', default='', help='Password for PBS'),
+    StrOpt('pbs_datastore', default='', help='Datastore on PBS'),
+    StrOpt('pbs_backup_type', default='vm',
+           help='Backup Type to use (defaults to vm)'),
+    IntOpt('pbs_chunk_size', default=4 * 1024 * 1024,
+           help='Chunk size in bytes (default 4MB)'),
+    IntOpt('pbs_upload_threads', default=4,
+           help='Number of threads for upload (not implemented yet, async used)'),
 ]
 
-CONF = cfg.CONF
-CONF.register_opts(proxmoxbackup_service_opts)
+CONF.register_opts(pbs_backup_opts)
 
 
-class PBSDataBlob:
-    """Handler for Proxmox Backup Server data blob encoding/decoding.
+# --- Embedded PBS Client Logic (Adapted from pbs_backup_python) ---
 
-    PBS stores data in a specific blob format with magic numbers and CRC checks.
-    This class implements the encoding and decoding logic.
-    """
+# Uncompressed Blob Magic: [66, 171, 56, 7, 190, 131, 112, 161]
+UNCOMPRESSED_BLOB_MAGIC = bytes([66, 171, 56, 7, 190, 131, 112, 161])
+ENCRYPTED_BLOB_MAGIC = bytes([230, 89, 27, 191, 11, 191, 216, 11])
 
-    # Magic numbers for different blob types
-    # https://pbs.proxmox.com/docs/file-formats.html#data-blob-format
-    # [66, 171, 56, 7, 190, 131, 112, 161] -> 0xA17083BE0738AB42 (Little Endian)
-    UNENCRYPTED_UNCOMPRESSED_BLOB_MAGIC_1_0 = 0xA17083BE0738AB42
-    UNENCRYPTED_COMPRESSED_BLOB_MAGIC_1_0 = 0x0107_5670_ac7a_c807
 
-    def __init__(self, compress=False, encrypt=False):
-        """Initialize blob handler.
-
-        :param compress: Whether to compress the data
-        :param encrypt: Whether to encrypt the data (not yet implemented)
-        """
+class DataBlob:
+    def __init__(self, data: bytes, compress: bool = False, encrypt: bool = False):
+        self.data = data
         self.compress = compress
         self.encrypt = encrypt
 
-    def encode(self, data):
-        """Encode data into PBS blob format.
+    def encode(self) -> bytes:
+        if self.compress or self.encrypt:
+            raise NotImplementedError(
+                "Compression and Encryption not supported yet")
 
-        :param data: Raw bytes to encode
-        :returns: Encoded blob bytes
-        """
-        if self.encrypt:
-            raise NotImplementedError("Encryption not yet implemented")
+        magic = UNCOMPRESSED_BLOB_MAGIC
+        crc = zlib.crc32(self.data) & 0xFFFFFFFF
+        header = struct.pack('<8sI', magic, crc)
+        return header + self.data
 
-        # Determine magic number based on compression
-        if self.compress:
-            compressed = zlib.compress(data)
-            magic = self.UNENCRYPTED_COMPRESSED_BLOB_MAGIC_1_0
-            payload = compressed
-        else:
-            magic = self.UNENCRYPTED_UNCOMPRESSED_BLOB_MAGIC_1_0
-            payload = data
+    @staticmethod
+    def decode(raw_data: bytes) -> bytes:
+        if len(raw_data) < 12:
+            raise ValueError("Data too short")
 
-        # Calculate CRC32
-        crc = struct.unpack('<I', struct.pack('<I', 0xffffffff ^
-                                              zlib.crc32(payload) ^ 0xffffffff))[0]
+        magic, crc = struct.unpack('<8sI', raw_data[:12])
+        data = raw_data[12:]
 
-        # Build blob: magic(8) + crc(4) + data
-        blob = struct.pack('<Q', magic) + struct.pack('<I', crc) + payload
+        # Verify Magic
+        if magic != UNCOMPRESSED_BLOB_MAGIC:
+            # Just a warning or simple check for now, could be encrypted
+            pass
 
-        return blob
+        computed_crc = zlib.crc32(data) & 0xFFFFFFFF
+        if crc != computed_crc:
+            raise ValueError(
+                f"CRC Mismatch: expected {crc}, got {computed_crc}")
 
-    def decode(self, blob):
-        """Decode PBS blob format to raw data.
-
-        :param blob: Blob bytes to decode
-        :returns: Decoded raw bytes
-        """
-        if len(blob) < 12:
-            raise ValueError("Blob too small")
-
-        # Parse header
-        magic = struct.unpack('<Q', blob[0:8])[0]
-        crc_expected = struct.unpack('<I', blob[8:12])[0]
-        payload = blob[12:]
-
-        # Verify CRC
-        crc_actual = struct.unpack('<I', struct.pack('<I', 0xffffffff ^
-                                                     zlib.crc32(payload) ^ 0xffffffff))[0]
-        if crc_actual != crc_expected:
-            raise ValueError(f"CRC mismatch: expected {crc_expected}, "
-                             f"got {crc_actual}")
-
-        # Decompress if needed
-        if magic == self.UNENCRYPTED_COMPRESSED_BLOB_MAGIC_1_0:
-            return zlib.decompress(payload)
-        elif magic == self.UNENCRYPTED_UNCOMPRESSED_BLOB_MAGIC_1_0:
-            return payload
-        else:
-            raise ValueError(f"Unknown blob magic: {hex(magic)}")
+        return data
 
 
-class PBSClient:
-    """Client for communicating with Proxmox Backup Server API."""
-
-    def __init__(self, host, port, user, password, verify_ssl=True,
-                 fingerprint=None):
-        """Initialize PBS client.
-
-        :param host: PBS server hostname or IP
-        :param port: PBS server port
-        :param user: Username (e.g., 'root@pam')
-        :param password: Password
-        :param verify_ssl: Whether to verify SSL certificates
-        :param fingerprint: Optional SHA256 fingerprint for cert pinning
-        """
-        self.host = host
-        self.port = port
+class ProxmoxBackupClient:
+    def __init__(self, base_url: str, user: str, password: str, datastore: str, verify_ssl: bool = True):
+        self.base_url = base_url.rstrip('/')
         self.user = user
         self.password = password
-        self.verify_ssl = verify_ssl
-        self.fingerprint = fingerprint
-        self.base_url = f"https://{host}:{port}"
-        self.ticket = None
-        self.csrf_token = None
-        # Disable verify for now if configured, but ideally use a context
-        self.session = httpx.Client(
-            http2=True, verify=verify_ssl, timeout=60.0)
-
-    def _build_url(self, path):
-        """Build full URL for API endpoint."""
-        return f"{self.base_url}{path}"
-
-    def authenticate(self):
-        """Authenticate and get ticket/CSRF token."""
-        auth_url = self._build_url("/api2/json/access/ticket")
-
-        data = {
-            'username': self.user,
-            'password': self.password,
-        }
-
-        try:
-            response = self.session.post(auth_url, data=data)
-            response.raise_for_status()
-
-            result = response.json()
-            if 'data' not in result:
-                raise exception.BackupDriverException(
-                    _("Authentication failed: no data in response"))
-
-            self.ticket = result['data']['ticket']
-            self.csrf_token = result['data']['CSRFPreventionToken']
-
-            LOG.debug("Successfully authenticated to PBS server")
-
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            msg = _("Failed to authenticate to PBS: %s") % str(e)
-            raise exception.BackupDriverException(msg)
-
-    def _get_headers(self):
-        """Get HTTP headers with authentication."""
-        if not self.ticket or not self.csrf_token:
-            self.authenticate()
-
-        return {
-            'CSRFPreventionToken': self.csrf_token,
-            'Cookie': f'PBSAuthCookie={self.ticket}',
-        }
-
-    def create_backup(self, datastore, backup_type, backup_id, backup_time):
-        """Start a backup session.
-
-        :param datastore: Datastore name
-        :param backup_type: Backup type (e.g., 'host')
-        :param backup_id: Backup ID
-        :param backup_time: Backup timestamp (integer epoch)
-        """
-        path = "/api2/json/backup"
-        params = {
-            'store': datastore,
-            'backup-type': backup_type,
-            'backup-id': backup_id,
-            'backup-time': int(backup_time),
-            'benchmark': 'false'
-        }
-
-        url = self._build_url(path)
-        headers = self._get_headers()
-        # Required to upgrade to backup protocol
-        headers['Upgrade'] = 'proxmox-backup-protocol-v1'
-
-        try:
-            # We use the existing session which should be HTTP/2 enabled
-            response = self.session.get(url, params=params, headers=headers)
-            response.raise_for_status()
-            LOG.info(
-                f"Started PBS backup session for {backup_type}/{backup_id}")
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            msg = _("Failed to start PBS backup session: %s") % str(e)
-            raise exception.BackupDriverException(msg)
-
-    def create_fixed_index(self, archive_name, size):
-        """Create a new fixed index.
-
-        :param archive_name: Archive name (e.g. 'volume.fidx')
-        :param size: Total size of the archive
-        :returns: Writer ID (wid)
-        """
-        path = "/api2/json/fixed_index"
-        params = {
-            'archive-name': archive_name,
-            'size': size,
-        }
-
-        url = self._build_url(path)
-        headers = self._get_headers()
-
-        try:
-            response = self.session.post(url, params=params, headers=headers)
-            response.raise_for_status()
-            return int(response.json())
-        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
-            msg = _("Failed to create fixed index for archive: %s") % str(e)
-            raise exception.BackupDriverException(msg)
-
-    def upload_chunk(self, wid, chunk_data, size, encoded_size, digest):
-        """Upload a chunk to PBS.
-
-        :param wid: Writer ID
-        :param chunk_data: Chunk data (blob)
-        :param size: Original size of the chunk
-        :param encoded_size: Size of the encoded blob
-        :param digest: SHA256 digest of the chunk
-        """
-        path = "/api2/json/fixed_chunk"
-        params = {
-            'wid': wid,
-            'size': size,
-            'encoded-size': encoded_size,
-            'digest': digest,
-        }
-
-        url = self._build_url(path)
-        headers = self._get_headers()
-        headers['Content-Type'] = 'application/octet-stream'
-
-        try:
-            response = self.session.put(
-                url, params=params, headers=headers, content=chunk_data)
-            response.raise_for_status()
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            msg = _("Failed to upload chunk to fixed index: %s") % str(e)
-            raise exception.BackupDriverException(msg)
-
-    def append_index(self, digest_list, offset_list, wid):
-        """Append chunks to fixed index.
-
-        :param digest_list: JSON array of chunk digests
-        :param offset_list: JSON array of chunk offsets
-        :param wid: Writer ID
-        """
-        path = "/api2/json/fixed_index"
-        params = {
-            'digest-list': digest_list,
-            'offset-list': offset_list,
-            'wid': wid,
-        }
-
-        url = self._build_url(path)
-        headers = self._get_headers()
-
-        try:
-            response = self.session.put(url, params=params, headers=headers)
-            response.raise_for_status()
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            msg = _("Failed to append to fixed index: %s") % str(e)
-            raise exception.BackupDriverException(msg)
-
-    def close_fixed_index(self, chunk_count, csum, size, wid):
-        """Close the fixed index.
-
-        :param chunk_count: Number of chunks
-        :param csum: Checksum of the index (hex string)
-        :param size: Total size of data
-        :param wid: Writer ID
-        """
-        path = "/api2/json/fixed_close"
-        params = {
-            'chunk-count': chunk_count,
-            'csum': csum,
-            'size': size,
-            'wid': wid,
-        }
-
-        url = self._build_url(path)
-        headers = self._get_headers()
-
-        try:
-            response = self.session.post(url, params=params, headers=headers)
-            response.raise_for_status()
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            msg = _("Failed to close fixed index: %s") % str(e)
-            raise exception.BackupDriverException(msg)
-
-    def complete_backup(self):
-        """Mark backup as complete."""
-        path = "/api2/json/finish"
-
-        url = self._build_url(path)
-        headers = self._get_headers()
-
-        try:
-            response = self.session.post(url, headers=headers)
-            response.raise_for_status()
-            LOG.info("Completed PBS backup session")
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            msg = _("Failed to complete PBS backup session: %s") % str(e)
-            raise exception.BackupDriverException(msg)
-
-
-class ObjectWriter:
-    """Writer for PBS objects (chunks/blobs)."""
-
-    def __init__(self, client, datastore, name, compress=False, state=None):
-        """Initialize writer.
-
-        :param client: PBSClient instance
-        :param datastore: Datastore name
-        :param name: Object name
-        :param compress: Whether to compress data
-        :param state: Shared state dict for the backup session
-        """
-        self.client = client
         self.datastore = datastore
-        self.name = name
-        self.blob_handler = PBSDataBlob(compress=compress)
-        self.buffer = io.BytesIO()
-        self.state = state
+        self.ticket: Optional[str] = None
+        self.token: Optional[str] = None
+        # Using synchronous client for Cinder driver simplicity (Cinder is threaded)
+        self.client: Optional[httpx.Client] = None
+        # Note: If high concurrency is needed, Cinder usually relies on greenlets (eventlet).
+        # httpx.Client is sync (blocking). httpx.AsyncClient is async.
+        # Cinder drivers are often blocking calls that run in threads.
+        # To avoid async complexity in the driver, we will use sync implementation or run_async wrapper.
+        # Given Cinder's architecture, sync is safer unless using native logic.
+        self.verify_ssl = verify_ssl
 
-    def __enter__(self):
-        return self
+    def connect(self):
+        # Authenticate
+        with httpx.Client(verify=self.verify_ssl) as auth_client:
+            payload = {"username": self.user, "password": self.password}
+            resp = auth_client.post(
+                f"{self.base_url}/api2/json/access/ticket", json=payload)
+            resp.raise_for_status()
+            data = resp.json()['data']
+            self.ticket = data['ticket']
+            self.token = data['CSRFPreventionToken']
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None:
-            self.close()
-        return False
+        headers = {
+            "Cookie": f"PBSAuthCookie={self.ticket}",
+            "CSRFPreventionToken": self.token,
+            "Accept": "application/json",
+        }
 
-    def write(self, data):
-        """Write data to the object."""
-        self.buffer.write(data)
+        # HTTP/2 support in sync client? httpx supports it.
+        self.client = httpx.Client(
+            base_url=self.base_url,
+            headers=headers,
+            http2=True,
+            verify=self.verify_ssl,
+            timeout=120.0
+        )
+
+    def get_backup_writer(self, backup_type: str, backup_id: str, backup_time: int):
+        return BackupWriter(self, backup_type, backup_id, backup_time)
+
+    def get_backup_reader(self, backup_type: str, backup_id: str, backup_time: int):
+        return BackupReader(self, backup_type, backup_id, backup_time)
 
     def close(self):
-        """Finalize and upload the object."""
-        data = self.buffer.getvalue()
-        original_size = len(data)
-
-        # Encode as PBS blob
-        blob = self.blob_handler.encode(data)
-
-        # Calculate digest of the raw data (not the blob)
-        digest = hashlib.sha256(data).hexdigest()
-
-        # Upload to PBS
-        if self.state is not None:
-            wid = self.state['wid']
-
-            # Upload chunk
-            self.client.upload_chunk(
-                wid, blob, original_size, len(blob), digest)
-
-            # Track for appending to index
-            self.state['digests'].append(digest)
-            self.state['offsets'].append(self.state['current_offset'])
-
-            # Update offset and stats
-            self.state['current_offset'] += original_size
-            self.state['chunk_count'] += 1
-            self.state['total_size'] += original_size
-
-            # Update checksum (SHA256 of concatenated data)
-            self.state['csum'].update(data)
+        if self.client:
+            self.client.close()
 
 
-class ObjectReader:
-    """Reader for PBS objects - not implemented for fixed index restore."""
-
-    def __init__(self, client, datastore, name, extra_metadata=None):
-        """Initialize reader.
-
-        :param client: PBSClient instance
-        :param datastore: Datastore name
-        :param name: Object name
-        :param extra_metadata: Metadata
-        """
+class BackupWriter:
+    def __init__(self, client: ProxmoxBackupClient, backup_type: str, backup_id: str, backup_time: int):
         self.client = client
-        self.datastore = datastore
-        self.name = name
-        self.extra_metadata = extra_metadata or {}
-        self.data = None
+        self.backup_type = backup_type
+        self.backup_id = backup_id
+        self.backup_time = backup_time
 
-    def __enter__(self):
-        # Restore not yet implemented for fixed index
-        LOG.warning(
-            "Restore not yet implemented for Proxmox fixed index backups")
-        return self
+    def start(self):
+        params = {
+            "backup-type": self.backup_type,
+            "backup-id": self.backup_id,
+            "backup-time": self.backup_time,
+            "store": self.client.datastore,
+            "debug": True
+        }
+        resp = self.client.client.get("/api2/json/backup", params=params)
+        resp.raise_for_status()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        return False
+    def create_fixed_index(self, archive_name: str):
+        resp = self.client.client.post(
+            "/fixed_index", json={"archive-name": archive_name})
+        resp.raise_for_status()
 
-    def read(self):
-        """Read the object data."""
-        return self.data if self.data is not None else b''
+    def upload_fixed_chunk(self, data: bytes, digest: bytes):
+        blob = DataBlob(data)
+        encoded_data = blob.encode()
+        params = {"digest": digest.hex()}
+        resp = self.client.client.post(
+            "/fixed_chunk",
+            content=encoded_data,
+            params=params,
+            headers={"Content-Type": "application/octet-stream"}
+        )
+        resp.raise_for_status()
+
+    def append_fixed_index(self, digest: bytes, size: int):
+        params = {"digest": digest.hex(), "size": size}
+        resp = self.client.client.put("/fixed_index", json=params)
+        resp.raise_for_status()
+
+    def close_fixed_index(self):
+        self.client.client.post("/fixed_close").raise_for_status()
+
+    def finish(self):
+        self.client.client.post("/finish").raise_for_status()
 
 
-@interface.backupdriver
-class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
-    """Backup driver for Proxmox Backup Server.
+class BackupReader:
+    def __init__(self, client: ProxmoxBackupClient, backup_type: str, backup_id: str, backup_time: int):
+        self.client = client
+        self.backup_type = backup_type
+        self.backup_id = backup_id
+        self.backup_time = backup_time
+        # For restore, we assume we might need to 'download' calls.
+        # But wait, PBS protocol for restore might be different?
+        # Protocol: "Restore/Reader Protocol API"
+        # "GET /api2/json/reader" instead of backup?
+        # Let's check docs or source.
+        # Protocol docs: "Restore/Reader Protocol API ... GET /api2/json/reader ... This upgrades the connection..."
+        pass
 
-    This driver implements native PBS protocol communication without
-    relying on the proxmox-backup-client command-line tool.
-    """
+    def start_restore_session(self):
+        params = {
+            "backup-type": self.backup_type,
+            "backup-id": self.backup_id,
+            "backup-time": self.backup_time,
+            "store": self.client.datastore
+        }
+        resp = self.client.client.get("/api2/json/reader", params=params)
+        resp.raise_for_status()
+
+    def download_fixed_index(self, archive_name: str) -> List[bytes]:
+        # GET /download using simple HTTP?
+        # Or using the reader connection?
+        # The reader protocol is stateful on H2 connection usually.
+        # Docs: "Download Index Files ... GET /index"
+
+        # We need to know which index file to download.
+        # Protocol says: "GET /index?file-name=..."
+
+        params = {"file-name": archive_name}
+        resp = self.client.client.get("/index", params=params)
+        resp.raise_for_status()
+
+        # The response is the binary .fidx content.
+        # We need to parse it to get the chunk digests.
+        return self._parse_fixed_index(resp.content)
+
+    def _parse_fixed_index(self, data: bytes) -> List[bytes]:
+        # Format:
+        # MAGIC (8) | ... | digest1 (32) | ...
+        # Based on file-formats.html
+        # Header size is 4096 bytes.
+        HEADER_SIZE = 4096
+        MAGIC = bytes([47, 127, 65, 237, 145, 253, 15, 205])
+
+        if len(data) < HEADER_SIZE:
+            raise ValueError("Index file too short")
+
+        if data[:8] != MAGIC:
+            raise ValueError("Invalid Fixed Index Magic")
+
+        # Digests start at offest 4096
+        digests = []
+        offset = HEADER_SIZE
+        while offset < len(data):
+            digest = data[offset:offset + 32]
+            if len(digest) != 32:
+                break
+            digests.append(digest)
+            offset += 32
+
+        return digests
+
+    def download_chunk(self, digest: bytes) -> bytes:
+        # GET /chunk
+        params = {"digest": digest.hex()}
+        resp = self.client.client.get("/chunk", params=params)
+        resp.raise_for_status()
+
+        # Provided as Data Blob
+        return DataBlob.decode(resp.content)
+
+
+# --- Cinder Driver Implementation ---
+
+class PBSBackupDriver(BackupDriver):
+    """Proxmox Backup Server Driver."""
 
     def __init__(self, context):
-        """Initialize the Proxmox Backup driver.
+        super(PBSBackupDriver, self).__init__(context)
+        self.pbs_url = CONF.pbs_url
+        self.pbs_user = CONF.pbs_user
+        self.pbs_password = CONF.pbs_password
+        self.pbs_datastore = CONF.pbs_datastore
+        self.pbs_backup_type = CONF.pbs_backup_type
+        self.chunk_size = CONF.pbs_chunk_size
 
-        :param context: The security context
-        """
-        chunk_size = CONF.backup_proxmox_chunk_size
-        sha_block_size = CONF.backup_proxmox_block_size
-        backup_default_container = CONF.backup_proxmox_datastore
-        enable_progress_timer = CONF.backup_proxmox_enable_progress_timer
-
-        super(ProxmoxBackupDriver, self).__init__(
-            context,
-            chunk_size,
-            sha_block_size,
-            backup_default_container,
-            enable_progress_timer,
-        )
-
-        self._validate_config()
-        self._active_clients = {}
-        self._backup_state = {}  # State for active backups: backup_id -> dict
-
-    def _validate_config(self):
-        """Validate required configuration options."""
-        required = [
-            'backup_proxmox_host',
-            'backup_proxmox_user',
-            'backup_proxmox_password',
-            'backup_proxmox_datastore',
-        ]
-
-        for opt in required:
-            if not getattr(CONF, opt):
-                msg = _("Configuration option %s is required") % opt
-                raise exception.BackupDriverException(msg)
+        if not all([self.pbs_url, self.pbs_user, self.pbs_password, self.pbs_datastore]):
+            # In real cinder, might want to check this more gracefully or default
+            LOG.warning("PBS credentials not fully configured.")
 
     def _get_client(self):
-        """Get or create PBS client instance."""
-        return PBSClient(
-            host=CONF.backup_proxmox_host,
-            port=CONF.backup_proxmox_port,
-            user=CONF.backup_proxmox_user,
-            password=CONF.backup_proxmox_password,
-            verify_ssl=CONF.backup_proxmox_verify_ssl,
-            fingerprint=CONF.backup_proxmox_fingerprint,
+        return ProxmoxBackupClient(
+            base_url=self.pbs_url,
+            user=self.pbs_user,
+            password=self.pbs_password,
+            datastore=self.pbs_datastore,
+            verify_ssl=False  # Configurable?
         )
 
-    def _prepare_backup(self, backup):
-        """Prepare the backup."""
-        # Start PBS session
-        client = self._get_client()
-        client.authenticate()
-
-        # Use 'host' type for generic data
-        backup_type = 'host'
-        backup_id = f"volume-{backup.volume_id}"
-        # Use created_at timestamp for consistency
-        if backup.created_at:
-            backup_time = int(backup.created_at.timestamp())
-        else:
-            backup_time = int(time.time())
-
-        client.create_backup(CONF.backup_proxmox_datastore,
-                             backup_type, backup_id, backup_time)
-
-        # For fixed index, we need to know the total size upfront
-        # We'll use the volume size as approximation
-        # TODO: Get more accurate size estimate
-        volume_size_bytes = backup.size * 1024 * 1024 * 1024  # GB to bytes
-
-        # Create the fixed index for volume data
-        wid = client.create_fixed_index("volume.fidx", volume_size_bytes)
-
-        # Store client and state
-        self._active_clients[backup.id] = client
-        self._backup_state[backup.id] = {
-            'wid': wid,
-            'chunk_count': 0,
-            'total_size': 0,
-            'current_offset': 0,
-            'digests': [],
-            'offsets': [],
-            'csum': hashlib.sha256(),
-        }
-
-        return super(ProxmoxBackupDriver, self)._prepare_backup(backup)
-
-    def _finalize_backup(self, backup, container, object_meta, object_sha256):
-        """Finalize the backup."""
-        try:
-            super(ProxmoxBackupDriver, self)._finalize_backup(backup, container,
-                                                              object_meta, object_sha256)
-        finally:
-            client = self._active_clients.get(backup.id)
-            state = self._backup_state.get(backup.id)
-
-            if client and state:
-                try:
-                    # Append all chunks to the index
-                    if state['digests'] and state['offsets']:
-                        import json
-                        digest_list = json.dumps(state['digests'])
-                        offset_list = json.dumps(state['offsets'])
-                        client.append_index(
-                            digest_list, offset_list, state['wid'])
-
-                    # Close the fixed index
-                    client.close_fixed_index(
-                        state['chunk_count'],
-                        state['csum'].hexdigest(),
-                        state['total_size'],
-                        state['wid']
-                    )
-
-                    # Complete backup
-                    client.complete_backup()
-                except Exception as e:
-                    LOG.error(f"Error finishing PBS backup: {e}")
-                    raise
-                finally:
-                    del self._active_clients[backup.id]
-                    del self._backup_state[backup.id]
-
-    def put_container(self, container):
-        """Create the datastore/namespace if needed.
-
-        :param container: Container name (datastore)
-        """
-        # In PBS, datastores are pre-created via admin interface
-        # Namespaces can be created via API if needed
-        LOG.debug(f"Using PBS datastore: {container}")
-
-    def get_container_entries(self, container, prefix):
-        """Get backup entries in the datastore.
-
-        :param container: Container name (datastore)
-        :param prefix: Prefix for filtering backups
-        :returns: List of backup names
-        """
-        # Would query PBS API for backup snapshots
-        # For now, return empty list
-        LOG.debug(f"Listing backups in {container} with prefix {prefix}")
-        return []
-
-    def get_object_writer(self, container, object_name, extra_metadata=None):
-        """Get a writer for uploading an object."""
-        backup_id = extra_metadata.get('backup_id') if extra_metadata else None
-        client = self._active_clients.get(backup_id)
-        state = self._backup_state.get(backup_id)
-
-        if not client:
-            raise exception.BackupDriverException(
-                "No active PBS session for backup")
-
-        # Disable compression in PBSDataBlob if Cinder is already compressing
-        return ObjectWriter(client, container, object_name,
-                            compress=False,
-                            state=state)
-
-    def get_object_reader(self, container, object_name, extra_metadata=None):
-        """Get a reader for downloading an object."""
-        client = self._get_client()
-        return ObjectReader(client, container, object_name, extra_metadata)
-
-    def update_container_name(self, backup, container):
-        """Update container name if needed.
-
-        :param backup: Backup object
-        :param container: Proposed container name
-        :returns: Updated container name or None
-        """
-        # Use configured datastore
-        return CONF.backup_proxmox_datastore
-
-    def get_extra_metadata(self, backup, volume):
-        """Get extra metadata for the backup."""
-        # Ensure we use the same timestamp as _prepare_backup
-        if backup.created_at:
-            backup_time = int(backup.created_at.timestamp())
-        else:
-            backup_time = int(time.time())
-
-        return {
-            'volume_id': volume['id'],
-            'volume_size': volume['size'],
-            'backup_id': backup.id,
-            'backup_time': backup_time,
-            'datastore': CONF.backup_proxmox_datastore,
-            'namespace': CONF.backup_proxmox_namespace,
-        }
-
     def check_for_setup_error(self):
-        """Verify PBS connection and configuration."""
+        """Returns None if setup is correct, else raises exception."""
+        if not self.pbs_url:
+            raise exception.InvalidConfigurationValue(
+                option='pbs_url', value=self.pbs_url)
+
+    def backup(self, backup, volume_file, backup_metadata=False):
+        """
+        Backup a volume to PBS.
+        """
+        client = self._get_client()
         try:
-            client = self._get_client()
-            client.authenticate()
-            LOG.info("Successfully connected to Proxmox Backup Server at %s:%s",
-                     CONF.backup_proxmox_host, CONF.backup_proxmox_port)
+            client.connect()
+
+            # Use current time or backup object creation time
+            # Cinder backup object has keys? `backup.created_at`?
+            # backup['id'] is UUID.
+            backup_id = backup.id
+            backup_time = int(time.time())  # Use current time for new backup
+
+            writer = client.get_backup_writer(
+                self.pbs_backup_type, backup_id, backup_time)
+            writer.start()
+
+            # Archive name: volume-{uuid}.img.fidx
+            # volume_file is a file-like object.
+
+            # e.g. volume-uuid.img
+            archive_name = f"volume-{backup.volume_id}.img"
+            index_name = archive_name + ".fidx"
+
+            writer.create_fixed_index(index_name)
+
+            while True:
+                data = volume_file.read(self.chunk_size)
+                if not data:
+                    break
+
+                digest = hashlib.sha256(data).digest()
+                writer.upload_fixed_chunk(data, digest)
+                writer.append_fixed_index(digest, len(data))
+
+            writer.close_fixed_index()
+            writer.finish()
+
+            # Save metadata to service metadata to allow restore
+            # We need to know the backup_time and backup_type to restore?
+            # backup['service_metadata'] = ...
+            service_metadata = {
+                "backup_id": backup_id,
+                "backup_time": backup_time,
+                "archive_name": index_name
+            }
+            backup.service_metadata = json.dumps(service_metadata)
+            backup.save()
+
         except Exception as e:
-            msg = _("Failed to connect to Proxmox Backup Server: %s") % str(e)
-            raise exception.BackupDriverException(msg)
+            LOG.exception("Backup failed")
+            raise exception.BackupOperationError(reason=str(e))
+        finally:
+            client.close()
 
+    def restore(self, backup, volume_id, volume_file, volume_is_new):
+        """
+        Restore a backup.
+        """
+        if not backup.service_metadata:
+            raise exception.BackupOperationError(
+                reason="Missing service metadata")
 
-def get_backup_driver(context):
-    """Return a Proxmox Backup driver instance.
+        meta = json.loads(backup.service_metadata)
+        backup_id = meta.get("backup_id", backup.id)
+        backup_time = meta.get("backup_time")
+        archive_name = meta.get("archive_name")
 
-    :param context: Security context
-    :returns: ProxmoxBackupDriver instance
-    """
-    return ProxmoxBackupDriver(context)
+        client = self._get_client()
+        try:
+            client.connect()
+            reader = client.get_backup_reader(
+                self.pbs_backup_type, backup_id, backup_time)
+            reader.start_restore_session()
+
+            # Download Index
+            digests = reader.download_fixed_index(archive_name)
+
+            for digest in digests:
+                data = reader.download_chunk(digest)
+                volume_file.write(data)
+
+        except Exception as e:
+            LOG.exception("Restore failed")
+            raise exception.BackupOperationError(reason=str(e))
+        finally:
+            client.close()
+
+    def delete_backup(self, backup):
+        """
+        Delete a backup from PBS.
+        """
+        # PBS calls this "Forget".
+        # DELETE /api2/json/admin/datastore/{store}/snapshots
+        # Params: backup-type, backup-id, backup-time
+        if not backup.service_metadata:
+            LOG.warning(
+                "No metadata for backup, cannot delete from PBS cleanly.")
+            return
+
+        meta = json.loads(backup.service_metadata)
+        backup_id = meta.get("backup_id", backup.id)
+        backup_time = meta.get("backup_time")
+
+        client = self._get_client()
+        try:
+            client.connect()
+            # Standard API call (not on H2 session maybe? or yes?)
+            # Usually admin API is on the main port path.
+
+            # Snapshot path: {type}/{id}/{time}
+            snapshot_path = f"{self.pbs_backup_type}/{backup_id}/{backup_time}"
+
+            resp = client.client.delete(
+                f"/api2/json/admin/datastore/{self.pbs_datastore}/snapshots/{snapshot_path}")
+            # If 404, assumed deleted
+            if resp.status_code == 404:
+                return
+            resp.raise_for_status()
+
+        except Exception as e:
+            # Cinder expects us to log but maybe not raise if we want to force delete locally?
+            LOG.error(f"Failed to delete backup on PBS: {e}")
+            # raise?
+        finally:
+            client.close()
