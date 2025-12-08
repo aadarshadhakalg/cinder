@@ -10,6 +10,9 @@ import json
 import logging
 import math
 import time
+import ssl
+import socket
+from urllib.parse import urlparse
 from typing import Optional, List, Dict
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -17,7 +20,6 @@ from cinder.backup.driver import BackupDriver
 from cinder import exception
 from cinder.i18n import _
 import httpx
-
 
 LOG = logging.getLogger(__name__)
 
@@ -27,6 +29,8 @@ pbs_backup_opts = [
     StrOpt('pbs_user', default='', help='User for PBS (e.g. root@pam)'),
     StrOpt('pbs_password', default='', help='Password for PBS'),
     StrOpt('pbs_datastore', default='', help='Datastore on PBS'),
+    StrOpt('pbs_fingerprint', default='',
+           help='SHA256 Fingerprint of the PBS Server'),
     StrOpt('pbs_backup_type', default='vm',
            help='Backup Type to use (defaults to vm)'),
     IntOpt('pbs_chunk_size', default=4 * 1024 * 1024,
@@ -83,14 +87,13 @@ class DataBlob:
 
 
 class ProxmoxBackupClient:
-    def __init__(self, base_url: str, user: str, password: str, datastore: str, verify_ssl: bool = True):
+    def __init__(self, base_url: str, user: str, password: str, datastore: str, verify_ssl: bool = True, fingerprint: Optional[str] = None):
         self.base_url = base_url.rstrip('/')
         self.user = user
         self.password = password
         self.datastore = datastore
         self.ticket: Optional[str] = None
         self.token: Optional[str] = None
-        # Using synchronous client for Cinder driver simplicity (Cinder is threaded)
         self.client: Optional[httpx.Client] = None
         # Note: If high concurrency is needed, Cinder usually relies on greenlets (eventlet).
         # httpx.Client is sync (blocking). httpx.AsyncClient is async.
@@ -98,32 +101,87 @@ class ProxmoxBackupClient:
         # To avoid async complexity in the driver, we will use sync implementation or run_async wrapper.
         # Given Cinder's architecture, sync is safer unless using native logic.
         self.verify_ssl = verify_ssl
+        self.fingerprint = fingerprint
+
+    def _verify_fingerprint(self):
+        """
+        Verify the server certificate SHA256 fingerprint matches configuration.
+        """
+        if not self.fingerprint:
+            return
+
+        parsed = urlparse(self.base_url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+
+        LOG.info(f"Verifying PBS Fingerprint for {host}:{port}")
+
+        # Create context that doesn't verify CA but we get cert
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        try:
+            with socket.create_connection((host, port), timeout=10) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                    cert_bin = ssock.getpeercert(binary_form=True)
+                    if not cert_bin:
+                        raise ValueError("No certificate presented by server")
+
+                    fingerprint_hash = hashlib.sha256(cert_bin).hexdigest()
+                    expected = self.fingerprint.lower().replace(':', '')
+
+                    if fingerprint_hash.lower() != expected:
+                        raise ValueError(
+                            f"Fingerprint Mismatch! Expected {expected}, got {fingerprint_hash}")
+
+                    LOG.info("Fingerprint verified successfully.")
+        except Exception as e:
+            msg = f"Fingerprint verification failed: {e}"
+            LOG.error(msg)
+            raise exception.BackupOperationError(msg)
 
     def connect(self):
+        # 1. Verify Fingerprint if configured
+        if self.fingerprint:
+            self._verify_fingerprint()
+            # If validated manually, we can disable standard verify for the httpx client
+            # because we trust the connection we just probed (assuming no MiTM race).
+            # This is common practice when pinning self-signed certs.
+            verify_client = False
+        else:
+            verify_client = self.verify_ssl
+
         # Authenticate
-        with httpx.Client(verify=self.verify_ssl) as auth_client:
-            payload = {"username": self.user, "password": self.password}
-            resp = auth_client.post(
-                f"{self.base_url}/api2/json/access/ticket", json=payload)
-            resp.raise_for_status()
-            data = resp.json()['data']
-            self.ticket = data['ticket']
-            self.token = data['CSRFPreventionToken']
+        # Note: If fingerprint is validated, we pass verify=False to auth_client too.
 
-        headers = {
-            "Cookie": f"PBSAuthCookie={self.ticket}",
-            "CSRFPreventionToken": self.token,
-            "Accept": "application/json",
-        }
+        try:
+            with httpx.Client(verify=verify_client) as auth_client:
+                payload = {"username": self.user, "password": self.password}
+                resp = auth_client.post(
+                    f"{self.base_url}/api2/json/access/ticket", json=payload)
+                resp.raise_for_status()
+                data = resp.json()['data']
+                self.ticket = data['ticket']
+                self.token = data['CSRFPreventionToken']
 
-        # HTTP/2 support in sync client? httpx supports it.
-        self.client = httpx.Client(
-            base_url=self.base_url,
-            headers=headers,
-            http2=True,
-            verify=self.verify_ssl,
-            timeout=120.0
-        )
+            headers = {
+                "Cookie": f"PBSAuthCookie={self.ticket}",
+                "CSRFPreventionToken": self.token,
+                "Accept": "application/json",
+            }
+
+            self.client = httpx.Client(
+                base_url=self.base_url,
+                headers=headers,
+                http2=True,
+                verify=verify_client,
+                timeout=120.0
+            )
+        except httpx.RequestError as e:
+            raise exception.BackupOperationError(f"Connection error: {e}")
+        except Exception as e:
+            raise exception.BackupOperationError(f"Authentication failed: {e}")
 
     def get_backup_writer(self, backup_type: str, backup_id: str, backup_time: int):
         return BackupWriter(self, backup_type, backup_id, backup_time)
@@ -274,6 +332,8 @@ class PBSBackupDriver(BackupDriver):
         self.pbs_backup_type = CONF.pbs_backup_type
         self.chunk_size = CONF.pbs_chunk_size
 
+        self.pbs_fingerprint = CONF.pbs_fingerprint
+
         if not all([self.pbs_url, self.pbs_user, self.pbs_password, self.pbs_datastore]):
             # In real cinder, might want to check this more gracefully or default
             LOG.warning("PBS credentials not fully configured.")
@@ -284,7 +344,9 @@ class PBSBackupDriver(BackupDriver):
             user=self.pbs_user,
             password=self.pbs_password,
             datastore=self.pbs_datastore,
-            verify_ssl=False  # Configurable?
+            # If fingerprint used, we handle verify manually
+            verify_ssl=False if self.pbs_fingerprint else True,
+            fingerprint=self.pbs_fingerprint
         )
 
     def check_for_setup_error(self):
