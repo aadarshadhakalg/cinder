@@ -689,6 +689,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         self._validate_config()
         self._active_clients = {}
         self._backup_state = {}  # State for active backups: backup_id -> dict
+        self._current_backup_id = None  # Track current backup being processed
 
     def _validate_config(self):
         """Validate required configuration options."""
@@ -717,6 +718,9 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def _prepare_backup(self, backup):
         """Prepare the backup."""
+        # Track current backup
+        self._current_backup_id = backup.id
+        
         # Start PBS session
         client = self._get_client()
         client.authenticate()
@@ -816,6 +820,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 del self._active_clients[backup.id]
             if backup.id in self._backup_state:
                 del self._backup_state[backup.id]
+            # Clear current backup tracking
+            self._current_backup_id = None
 
     def put_container(self, container):
         """Create the datastore / namespace if needed.
@@ -861,7 +867,11 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def get_object_writer(self, container, object_name, extra_metadata=None):
         """Get a writer for uploading an object."""
+        # Try to get backup_id from extra_metadata, fall back to current backup
         backup_id = extra_metadata.get('backup_id') if extra_metadata else None
+        if not backup_id:
+            backup_id = self._current_backup_id
+            
         client = self._active_clients.get(backup_id)
         state = self._backup_state.get(backup_id)
 
