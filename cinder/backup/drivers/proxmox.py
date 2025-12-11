@@ -607,12 +607,76 @@ class ObjectWriter:
             self.state['csum'].update(digest_bytes)
 
 
-class DummyWriter:
-    """Dummy writer for metadata files that PBS doesn't need.
+class MetadataWriter:
+    """Writer for metadata files that persists data in backup object's metadata.
     
-    PBS manages its own metadata (index.json.blob), so we discard
-    Cinder's metadata files like SHA256 checksums.
+    PBS manages its own metadata (index.json.blob), but Cinder needs
+    SHA256 files for incremental backups. We store these in the backup
+    object's metadata field in the database for persistence.
     """
+    
+    def __init__(self, driver, backup_id, object_name):
+        self.driver = driver
+        self.backup_id = backup_id
+        self.object_name = object_name
+        self.buffer = io.BytesIO()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.close()
+        return False
+    
+    def write(self, data):
+        """Store data in buffer."""
+        self.buffer.write(data)
+    
+    def close(self):
+        """Persist metadata to database via backup object."""
+        from cinder import db
+        from cinder import context as cinder_context
+        
+        data = self.buffer.getvalue()
+        
+        # Also keep in memory cache for current session
+        if not hasattr(self.driver, '_backup_metadata'):
+            self.driver._backup_metadata = {}
+        if self.backup_id not in self.driver._backup_metadata:
+            self.driver._backup_metadata[self.backup_id] = {}
+        self.driver._backup_metadata[self.backup_id][self.object_name] = data
+        
+        # Persist to database
+        try:
+            # Get admin context to update backup metadata
+            ctxt = cinder_context.get_admin_context()
+            backup = db.backup_get(ctxt, self.backup_id)
+            
+            # Get existing metadata or create new dict
+            metadata = backup.get('metadata') or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            
+            # Store the file data as base64 encoded string
+            import base64
+            metadata[f'pbs_meta_{self.object_name}'] = base64.b64encode(data).decode('utf-8')
+            
+            # Update backup with new metadata
+            db.backup_metadata_update(ctxt, self.backup_id, metadata, False)
+            
+            LOG.debug(f"Persisted metadata {self.object_name} ({len(data)} bytes) "
+                     f"to database for backup {self.backup_id}")
+        except Exception as e:
+            LOG.warning(f"Failed to persist metadata to database: {e}")
+            # Continue - we still have it in memory cache for this session
+
+
+class MetadataReader:
+    """Reader for metadata files stored in backup metadata."""
+    
+    def __init__(self, data):
+        self.data = data
     
     def __enter__(self):
         return self
@@ -620,13 +684,9 @@ class DummyWriter:
     def __exit__(self, exc_type, exc_val, exc_tb):
         return False
     
-    def write(self, data):
-        """Discard data - PBS doesn't need this metadata."""
-        pass
-    
-    def close(self):
-        """No-op close."""
-        pass
+    def read(self):
+        """Return the stored metadata."""
+        return self.data
 
 
 class ObjectReader:
@@ -690,6 +750,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         self._active_clients = {}
         self._backup_state = {}  # State for active backups: backup_id -> dict
         self._current_backup_id = None  # Track current backup being processed
+        self._backup_metadata = {}  # Store metadata files: backup_id -> {filename: data}
+        self._backup_metadata = {}  # Store metadata files: backup_id -> {filename: data}
 
     def _validate_config(self):
         """Validate required configuration options."""
@@ -820,6 +882,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 del self._active_clients[backup.id]
             if backup.id in self._backup_state:
                 del self._backup_state[backup.id]
+            # Note: We keep _backup_metadata[backup.id] for incremental backups
+            # It will be used when creating incremental backups that reference this one
             # Clear current backup tracking
             self._current_backup_id = None
 
@@ -881,15 +945,55 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
         # Check if this is for metadata files (after PBS finalization)
         if state and state.get('pbs_finalized', False):
-            # Return a dummy writer that discards metadata
-            # PBS manages its own metadata, we don't need Cinder's metadata files
-            return DummyWriter()
+            # Return a metadata writer that stores data for incremental backups
+            # PBS manages its own metadata, but we need SHA256 files for Cinder's incremental logic
+            return MetadataWriter(self, backup_id, object_name)
         
         # For volume data chunks, use ObjectWriter
         return ObjectWriter(client, container, object_name, state=state)
 
     def get_object_reader(self, container, object_name, extra_metadata=None):
         """Get a reader for downloading an object."""
+        from cinder import db
+        from cinder import context as cinder_context
+        
+        # Check if this is a metadata file request
+        backup_id = extra_metadata.get('backup_id') if extra_metadata else None
+        
+        if backup_id:
+            # First check memory cache
+            if hasattr(self, '_backup_metadata'):
+                metadata_dict = self._backup_metadata.get(backup_id, {})
+                if object_name in metadata_dict:
+                    LOG.debug(f"Retrieved metadata {object_name} from cache for backup {backup_id}")
+                    return MetadataReader(metadata_dict[object_name])
+            
+            # Try to load from database
+            try:
+                ctxt = cinder_context.get_admin_context()
+                backup = db.backup_get(ctxt, backup_id)
+                metadata = backup.get('metadata') or {}
+                
+                # Look for the metadata file
+                metadata_key = f'pbs_meta_{object_name}'
+                if metadata_key in metadata:
+                    import base64
+                    data = base64.b64decode(metadata[metadata_key])
+                    
+                    # Cache it for future use
+                    if not hasattr(self, '_backup_metadata'):
+                        self._backup_metadata = {}
+                    if backup_id not in self._backup_metadata:
+                        self._backup_metadata[backup_id] = {}
+                    self._backup_metadata[backup_id][object_name] = data
+                    
+                    LOG.debug(f"Retrieved metadata {object_name} from database for backup {backup_id}")
+                    return MetadataReader(data)
+            except Exception as e:
+                LOG.warning(f"Failed to load metadata from database: {e}")
+        
+        # For actual backup data, would query PBS
+        # For now, return empty reader (restore not implemented)
         client = self._get_client()
         return ObjectReader(client, container, object_name, extra_metadata)
 
