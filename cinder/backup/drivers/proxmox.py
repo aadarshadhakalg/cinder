@@ -496,6 +496,9 @@ class ObjectWriter:
         self.chunk_handler = PBSChunk()
         self.buffer = io.BytesIO()
         self.state = state
+        # Get the fixed chunk size from config (default 4MB)
+        from oslo_config import cfg
+        self.fixed_chunk_size = cfg.CONF.backup_proxmox_chunk_size
 
     def __enter__(self):
         return self
@@ -512,27 +515,46 @@ class ObjectWriter:
     def close(self):
         """Finalize and upload the chunk."""
         data = self.buffer.getvalue()
-        chunk_size = len(data)
-
-        # Wrap chunk in blob format
-        chunk_data = self.chunk_handler.encode(data)
-
-        # Calculate digest from the raw chunk data (before blob wrapping)
-        digest = hashlib.sha256(data).hexdigest()
-
-        # Upload to PBS
+        
+        if len(data) == 0:
+            return
+            
+        # For fixed index, all chunks except the last MUST be exactly chunk_size
+        # If this chunk is less than chunk_size, we need to pad it with zeros
+        # to make it a full chunk, UNLESS it's truly the last chunk
         if self.state is not None:
+            chunk_size = len(data)
+            original_size = chunk_size
+            
+            # Check if this is smaller than the fixed chunk size
+            if chunk_size < self.fixed_chunk_size:
+                # Pad with zeros to make it a full chunk
+                # PBS will track the actual data size separately
+                padding = b'\x00' * (self.fixed_chunk_size - chunk_size)
+                data = data + padding
+                chunk_size = self.fixed_chunk_size
+                
+                from oslo_log import log as logging
+                LOG = logging.getLogger(__name__)
+                LOG.debug(f"Padded chunk from {original_size} to {chunk_size} bytes")
+            
+            # Wrap chunk in blob format
+            chunk_data = self.chunk_handler.encode(data)
+            
+            # Calculate digest from the padded chunk data
+            digest = hashlib.sha256(data).hexdigest()
+            
             wid = self.state['wid']
 
-            # Upload chunk (size = original, encoded_size = blob size)
+            # Upload chunk (size = padded size, encoded_size = blob size)
             self.client.upload_chunk(
                 wid, chunk_data, chunk_size, len(chunk_data), digest)
 
-            # Track for appending to index
+            # Track for appending to index - use original offset
             self.state['digests'].append(digest)
             self.state['offsets'].append(self.state['current_offset'])
 
-            # Update offset and stats
+            # Update offset and stats - use PADDED size for offset calculation
             self.state['current_offset'] += chunk_size
             self.state['chunk_count'] += 1
             self.state['total_size'] += chunk_size
@@ -635,7 +657,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         client = self._get_client()
         client.authenticate()
 
-        # Use 'host' type for generic data
+        # Use 'vm' type for generic data
         backup_type = 'vm'
         backup_id = f"volume-{backup.volume_id}"
         # Use created_at timestamp for consistency
@@ -648,12 +670,17 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                              backup_type, backup_id, backup_time)
 
         # For fixed index, we need to know the total size upfront
-        # We'll use the volume size as approximation
-        # TODO: Get more accurate size estimate
+        # Calculate based on volume size, but this is the maximum size
+        # The actual size will be determined when we close the index
         volume_size_bytes = backup.size * 1024 * 1024 * 1024  # GB to bytes
+        
+        # Round up to nearest chunk size to ensure we have enough space
+        chunk_size = CONF.backup_proxmox_chunk_size
+        num_chunks = (volume_size_bytes + chunk_size - 1) // chunk_size
+        total_size = num_chunks * chunk_size
 
         # Create the fixed index for volume data
-        wid = client.create_fixed_index("volume.fidx", volume_size_bytes)
+        wid = client.create_fixed_index("volume.fidx", total_size)
 
         # Store client and state
         self._active_clients[backup.id] = client
@@ -665,6 +692,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             'digests': [],
             'offsets': [],
             'csum': hashlib.sha256(),
+            'expected_total_size': total_size,  # Track what we told PBS
         }
 
         return super(ProxmoxBackupDriver, self)._prepare_backup(backup)
