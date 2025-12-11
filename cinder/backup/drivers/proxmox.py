@@ -641,11 +641,11 @@ class MetadataWriter:
         data = self.buffer.getvalue()
         
         # Also keep in memory cache for current session
-        if not hasattr(self.driver, '_backup_metadata'):
-            self.driver._backup_metadata = {}
-        if self.backup_id not in self.driver._backup_metadata:
-            self.driver._backup_metadata[self.backup_id] = {}
-        self.driver._backup_metadata[self.backup_id][self.object_name] = data
+        if not hasattr(self.driver, '_pbs_metadata_cache'):
+            self.driver._pbs_metadata_cache = {}
+        if self.backup_id not in self.driver._pbs_metadata_cache:
+            self.driver._pbs_metadata_cache[self.backup_id] = {}
+        self.driver._pbs_metadata_cache[self.backup_id][self.object_name] = data
         
         # Persist to database
         try:
@@ -962,8 +962,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         
         if backup_id:
             # First check memory cache
-            if hasattr(self, '_backup_metadata'):
-                metadata_dict = self._backup_metadata.get(backup_id, {})
+            if hasattr(self, '_pbs_metadata_cache'):
+                metadata_dict = self._pbs_metadata_cache.get(backup_id, {})
                 if object_name in metadata_dict:
                     LOG.debug(f"Retrieved metadata {object_name} from cache for backup {backup_id}")
                     return MetadataReader(metadata_dict[object_name])
@@ -981,11 +981,11 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                     data = base64.b64decode(metadata[metadata_key])
                     
                     # Cache it for future use
-                    if not hasattr(self, '_backup_metadata'):
-                        self._backup_metadata = {}
-                    if backup_id not in self._backup_metadata:
-                        self._backup_metadata[backup_id] = {}
-                    self._backup_metadata[backup_id][object_name] = data
+                    if not hasattr(self, '_pbs_metadata_cache'):
+                        self._pbs_metadata_cache = {}
+                    if backup_id not in self._pbs_metadata_cache:
+                        self._pbs_metadata_cache[backup_id] = {}
+                    self._pbs_metadata_cache[backup_id][object_name] = data
                     
                     LOG.debug(f"Retrieved metadata {object_name} from database for backup {backup_id}")
                     return MetadataReader(data)
