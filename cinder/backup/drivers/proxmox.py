@@ -607,6 +607,28 @@ class ObjectWriter:
             self.state['csum'].update(digest_bytes)
 
 
+class DummyWriter:
+    """Dummy writer for metadata files that PBS doesn't need.
+    
+    PBS manages its own metadata (index.json.blob), so we discard
+    Cinder's metadata files like SHA256 checksums.
+    """
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+    
+    def write(self, data):
+        """Discard data - PBS doesn't need this metadata."""
+        pass
+    
+    def close(self):
+        """No-op close."""
+        pass
+
+
 class ObjectReader:
     """Reader for PBS objects - not implemented for fixed index restore."""
 
@@ -741,44 +763,59 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def _finalize_backup(self, backup, container, object_meta, object_sha256):
         """Finalize the backup."""
+        client = self._active_clients.get(backup.id)
+        state = self._backup_state.get(backup.id)
+
+        if client and state:
+            try:
+                # Append all chunks to the index
+                if state['digests'] and state['offsets']:
+                    client.append_index(
+                        state['digests'], state['offsets'], state['wid'])
+
+                # Close the fixed index
+                index_csum = state['csum'].hexdigest()
+                client.close_fixed_index(
+                    state['chunk_count'],
+                    index_csum,
+                    state['total_size'],
+                    state['wid']
+                )
+
+                # Upload manifest
+                client.upload_manifest(
+                    'volume.fidx',
+                    state['total_size'],
+                    index_csum
+                )
+
+                # Complete backup
+                client.complete_backup()
+                
+                LOG.info("PBS backup completed successfully")
+            except Exception as e:
+                LOG.error(f"Error finishing PBS backup: {e}")
+                # Cleanup before re-raising
+                if backup.id in self._active_clients:
+                    del self._active_clients[backup.id]
+                if backup.id in self._backup_state:
+                    del self._backup_state[backup.id]
+                raise
+        
+        # Now call parent's finalize - but mark that PBS is done
+        # so get_object_writer knows to handle metadata differently
+        if state:
+            state['pbs_finalized'] = True
+        
         try:
             super(ProxmoxBackupDriver, self)._finalize_backup(backup, container,
                                                               object_meta, object_sha256)
         finally:
-            client = self._active_clients.get(backup.id)
-            state = self._backup_state.get(backup.id)
-
-            if client and state:
-                try:
-                    # Append all chunks to the index
-                    if state['digests'] and state['offsets']:
-                        client.append_index(
-                            state['digests'], state['offsets'], state['wid'])
-
-                    # Close the fixed index
-                    index_csum = state['csum'].hexdigest()
-                    client.close_fixed_index(
-                        state['chunk_count'],
-                        index_csum,
-                        state['total_size'],
-                        state['wid']
-                    )
-
-                    # Upload manifest
-                    client.upload_manifest(
-                        'volume.fidx',
-                        state['total_size'],
-                        index_csum
-                    )
-
-                    # Complete backup
-                    client.complete_backup()
-                except Exception as e:
-                    LOG.error(f"Error finishing PBS backup: {e}")
-                    raise
-                finally:
-                    del self._active_clients[backup.id]
-                    del self._backup_state[backup.id]
+            # Clean up session after parent finalization
+            if backup.id in self._active_clients:
+                del self._active_clients[backup.id]
+            if backup.id in self._backup_state:
+                del self._backup_state[backup.id]
 
     def put_container(self, container):
         """Create the datastore / namespace if needed.
@@ -832,7 +869,13 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             raise exception.BackupDriverException(
                 "No active PBS session for backup")
 
-        # For fixed index, chunks are stored as raw data
+        # Check if this is for metadata files (after PBS finalization)
+        if state and state.get('pbs_finalized', False):
+            # Return a dummy writer that discards metadata
+            # PBS manages its own metadata, we don't need Cinder's metadata files
+            return DummyWriter()
+        
+        # For volume data chunks, use ObjectWriter
         return ObjectWriter(client, container, object_name, state=state)
 
     def get_object_reader(self, container, object_name, extra_metadata=None):
