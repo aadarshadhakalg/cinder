@@ -461,6 +461,48 @@ class PBSClient:
             msg = _("Failed to close fixed index: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
+    def upload_manifest(self, archive_name, size, csum):
+        """Upload the backup manifest (index.json.blob).
+        
+        :param archive_name: Archive filename (e.g., 'volume.fidx')
+        :param size: Total size of the archive
+        :param csum: Checksum of the archive
+        """
+        # Create manifest
+        manifest = {
+            "backup-type": self.backup_session['backup-type'],
+            "backup-id": self.backup_session['backup-id'],
+            "backup-time": self.backup_session['backup-time'],
+            "files": [
+                {
+                    "filename": archive_name,
+                    "size": size,
+                    "csum": csum,
+                }
+            ],
+        }
+
+        manifest_json = json.dumps(manifest, indent=2).encode()
+        
+        # Wrap manifest in blob format
+        chunk_handler = PBSChunk()
+        manifest_blob = chunk_handler.encode(manifest_json)
+
+        # Upload as index.json.blob
+        path = "/blob"
+        params = {
+            'file-name': 'index.json.blob',
+            'encoded-size': len(manifest_blob),
+        }
+
+        try:
+            headers, data = self._h2_request(
+                'POST', path, params=params, body=manifest_blob)
+            LOG.debug("Uploaded manifest (index.json.blob)")
+        except Exception as e:
+            msg = _("Failed to upload manifest: %s") % str(e)
+            raise exception.BackupDriverException(msg)
+
     def complete_backup(self):
         """Mark backup as complete."""
         path = "/finish"
@@ -714,11 +756,19 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                             state['digests'], state['offsets'], state['wid'])
 
                     # Close the fixed index
+                    index_csum = state['csum'].hexdigest()
                     client.close_fixed_index(
                         state['chunk_count'],
-                        state['csum'].hexdigest(),
+                        index_csum,
                         state['total_size'],
                         state['wid']
+                    )
+
+                    # Upload manifest
+                    client.upload_manifest(
+                        'volume.fidx',
+                        state['total_size'],
+                        index_csum
                     )
 
                     # Complete backup
