@@ -288,10 +288,87 @@ class PBSClient:
                 f"Started PBS backup session for {backup_type}/{backup_id}")
 
         except Exception as e:
+            msg = _("Failed to start PBS backup session: %s") % str(e)
+            raise exception.BackupDriverException(msg)
+
+    def create_restore(self, datastore, backup_type, backup_id, backup_time):
+        """Start a restore session and upgrade to HTTP/2 reader protocol.
+
+        :param datastore: Datastore name
+        :param backup_type: Backup type
+        :param backup_id: Backup ID
+        :param backup_time: Backup timestamp
+        """
+        # Create raw socket connection
+        sock = socket.create_connection((self.host, self.port))
+
+        # Wrap with SSL
+        context = ssl.create_default_context()
+        if not self.verify_ssl:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        self.sock = context.wrap_socket(sock, server_hostname=self.host)
+
+        # Send HTTP/1.1 upgrade request
+        headers = self._get_headers()
+        # Note: Reader protocol uses /api2/json/reader
+        upgrade_request = (
+            f"GET /api2/json/reader?"
+            f"store={datastore}&"
+            f"backup-type={backup_type}&"
+            f"backup-id={backup_id}&"
+            f"backup-time={int(backup_time)}&"
+            f"debug=true HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Upgrade: proxmox-backup-protocol-v1\r\n"
+            f"Cookie: {headers['Cookie']}\r\n"
+            f"CSRFPreventionToken: {headers['CSRFPreventionToken']}\r\n"
+            f"\r\n"
+        )
+
+        try:
+            LOG.debug("Sending HTTP/1.1 upgrade request (reader) to PBS")
+            self.sock.sendall(upgrade_request.encode())
+
+            # Read upgrade response
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise exception.BackupDriverException(
+                        _("Connection closed before upgrade complete"))
+                response += chunk
+
+            response_str = response.decode()
+
+            if "101 Switching Protocols" not in response_str:
+                raise exception.BackupDriverException(
+                    _("Upgrade failed: %s") % response_str)
+
+            LOG.debug("HTTP/2 upgrade successful (101 Switching Protocols)")
+
+            # Initialize H2 connection
+            config = h2.config.H2Configuration(client_side=True)
+            self.h2_conn = h2.connection.H2Connection(config=config)
+            self.h2_conn.initiate_connection()
+            self.sock.sendall(self.h2_conn.data_to_send())
+
+            LOG.debug("HTTP/2 connection initialized (Restore Session)")
+
+            # Store backup session info
+            self.backup_session = {
+                'store': datastore,
+                'backup-type': backup_type,
+                'backup-id': backup_id,
+                'backup-time': int(backup_time),
+            }
+
+        except Exception as e:
             if self.sock:
                 self.sock.close()
                 self.sock = None
-            msg = _("Failed to start PBS backup session: %s") % str(e)
+            msg = _("Failed to start PBS restore session: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
     def _h2_request(self, method, path, params=None, body=None,
@@ -501,6 +578,83 @@ class PBSClient:
             LOG.debug("Uploaded manifest (index.json.blob)")
         except Exception as e:
             msg = _("Failed to upload manifest: %s") % str(e)
+            raise exception.BackupDriverException(msg)
+
+    def download_index(self, archive_name):
+        """Download and parse the fixed index file.
+
+        :param archive_name: Name of the index file (e.g. volume.fidx)
+        :returns: List of chunk digests (hex strings)
+        """
+        path = "/index"
+        params = {'file-name': archive_name}
+
+        try:
+            headers, data = self._h2_request('GET', path, params=params)
+            
+            # Parse fixed index
+            # Format: MAGIC (8 bytes) + ... + Digests (starts at 4096)
+            HEADER_SIZE = 4096
+            # Magic for fixed index
+            MAGIC = bytes([47, 127, 65, 237, 145, 253, 15, 205])
+            
+            if len(data) < HEADER_SIZE:
+                raise exception.BackupDriverException("Index file too short")
+                
+            if data[:8] != MAGIC:
+                 raise exception.BackupDriverException("Invalid fixed index magic")
+                 
+            digests = []
+            offset = HEADER_SIZE
+            # Each digest is 32 bytes
+            while offset + 32 <= len(data):
+                digest = data[offset:offset + 32]
+                digests.append(digest.hex())
+                offset += 32
+                
+            return digests
+
+        except Exception as e:
+            msg = _("Failed to download index: %s") % str(e)
+            raise exception.BackupDriverException(msg)
+
+    def download_chunk(self, digest):
+        """Download a chunk by its digest.
+        
+        :param digest: Hex string digest
+        :returns: Blob bytes
+        """
+        path = '/chunk'
+        params = {'digest': digest}
+        
+        try:
+            headers, data = self._h2_request('GET', path, params=params)
+            return data
+        except Exception as e:
+            msg = _("Failed to download chunk %s: %s") % (digest, str(e))
+            raise exception.BackupDriverException(msg)
+
+    def delete_snapshot(self, datastore, backup_type, backup_id, backup_time):
+        """Delete a snapshot using the API."""
+        path = f"/api2/json/admin/datastore/{datastore}/snapshots/{backup_type}/{backup_id}/{backup_time}"
+        url = self._build_url(path)
+        headers = self._get_headers()
+        
+        try:
+            # We use the auth_session, but we need to add tokens in headers if not present
+            # httpx Client merges headers, so we can pass them in the call
+            response = self.auth_session.delete(url, headers=headers)
+            
+            # 200 OK or 404 Not Found (already deleted) are acceptable
+            if response.status_code == 404:
+                LOG.warning(f"Snapshot {path} not found for deletion")
+                return
+                
+            response.raise_for_status()
+            LOG.info(f"Deleted snapshot {path}")
+            
+        except Exception as e:
+            msg = _("Failed to delete snapshot: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
     def complete_backup(self):
@@ -720,6 +874,19 @@ class ObjectReader:
         return self.data if self.data is not None else b''
 
 
+class PBSChunkReader:
+    """Reader for PBS chunks."""
+    
+    def __init__(self, client):
+        self.chunk_handler = PBSChunk()
+        self.client = client
+        
+    def read_chunk(self, digest):
+        """Download and decode a chunk."""
+        blob_data = self.client.download_chunk(digest)
+        return self.chunk_handler.decode(blob_data)
+
+
 @interface.backupdriver
 class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     """Backup driver for Proxmox Backup Server.
@@ -925,8 +1092,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         """
         # For PBS, objects are managed as part of backup snapshots
         # Individual chunk deletion is handled by PBS garbage collection
-        LOG.debug(f"Delete object {object_name} from {container}")
-        # TODO: Implement snapshot deletion via PBS API if needed
+        # But we do need to handle the delete_backup call in the driver,
+        # which calls delete_snapshot.
         pass
 
     def get_object_writer(self, container, object_name, extra_metadata=None):
@@ -1035,6 +1202,79 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             msg = _("Failed to connect to Proxmox Backup Server: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
+    def restore(self, backup, volume_id, volume_file, volume_is_new):
+        """Restore metadata and volume data from PBS backup."""
+        # 1. Connect to PBS
+        client = self._get_client()
+        client.authenticate()
+        
+        backup_type = 'vm'
+        backup_id = f"volume-{backup.volume_id}"
+        # We need the backup time. If it's not in service_metadata, 
+        # try logic from backup creation time.
+        backup_time = None
+        
+        # Try to recover backup_time from service_metadata first
+        # (Though we haven't implemented service_metadata storage yet in backup()!)
+        # Fallback to backup.created_at
+        if backup.created_at:
+             backup_time = int(backup.created_at.timestamp())
+        else:
+             msg = _("Backup has no timestamp information")
+             raise exception.BackupDriverException(msg)
+
+        LOG.info(f"Starting restore for {backup_id} (time: {backup_time})")
+
+        try:
+            # 2. Start restore session
+            client.create_restore(CONF.backup_proxmox_datastore,
+                                  backup_type, backup_id, backup_time)
+            
+            # 3. Download Index
+            # We assume standard name 'volume.fidx'
+            archive_name = "volume.fidx"
+            chunk_digests = client.download_index(archive_name)
+            
+            LOG.info(f"Downloaded index with {len(chunk_digests)} chunks")
+            
+            # 4. Download and write chunks
+            chunk_reader = PBSChunkReader(client)
+            
+            for i, digest in enumerate(chunk_digests):
+                data = chunk_reader.read_chunk(digest)
+                volume_file.write(data)
+                
+                # Progress logging every 10% or so could be added here
+                if i > 0 and i % 100 == 0:
+                    LOG.debug(f"Restored {i} / {len(chunk_digests)} chunks")
+
+            LOG.info("Restore completed successfully")
+            
+        except Exception as e:
+            LOG.error(f"Restore failed: {e}")
+            raise
+        finally:
+            if client.sock:
+                client.sock.close()
+
+    def delete_backup(self, backup):
+        """Delete backup from PBS."""
+        client = self._get_client()
+        client.authenticate()
+        
+        backup_type = 'vm'
+        backup_id = f"volume-{backup.volume_id}"
+        if backup.created_at:
+             backup_time = int(backup.created_at.timestamp())
+        else:
+             LOG.warning("Cannot delete backup without timestamp")
+             return
+
+        LOG.info(f"Deleting backup {backup_id} (time: {backup_time})")
+        
+        # We don't need a backup session for deletion, just authenticated API call
+        client.delete_snapshot(CONF.backup_proxmox_datastore,
+                               backup_type, backup_id, backup_time)
 
 def get_backup_driver(context):
     """Return a Proxmox Backup driver instance.
