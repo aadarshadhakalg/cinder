@@ -321,7 +321,7 @@ class PBSClient:
             f"debug=true HTTP/1.1\r\n"
             f"Host: {self.host}:{self.port}\r\n"
             f"Connection: Upgrade\r\n"
-            f"Upgrade: proxmox-backup-protocol-v1\r\n"
+            f"Upgrade: proxmox-backup-reader-protocol-v1\r\n"
             f"Cookie: {headers['Cookie']}\r\n"
             f"CSRFPreventionToken: {headers['CSRFPreventionToken']}\r\n"
             f"\r\n"
@@ -814,8 +814,20 @@ class MetadataWriter:
             
             # Store the file data as base64 encoded string
             import base64
-            metadata[f'pbs_meta_{self.object_name}'] = base64.b64encode(data).decode('utf-8')
+            b64_data = base64.b64encode(data).decode('utf-8')
             
+            # Split into 60KB chunks to fit in DB column
+            chunk_size = 60000
+            chunks = [b64_data[i:i + chunk_size] for i in range(0, len(b64_data), chunk_size)]
+            
+            # Store chunks
+            if chunks:
+                metadata[f'pbs_meta_{self.object_name}'] = chunks[0]
+                for i in range(1, len(chunks)):
+                    metadata[f'pbs_meta_{self.object_name}_{i}'] = chunks[i]
+            else:
+                 metadata[f'pbs_meta_{self.object_name}'] = ""
+
             # Update backup with new metadata
             db.backup_metadata_update(ctxt, self.backup_id, metadata, False)
             
@@ -1144,7 +1156,15 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 metadata_key = f'pbs_meta_{object_name}'
                 if metadata_key in metadata:
                     import base64
-                    data = base64.b64decode(metadata[metadata_key])
+                    b64_data = metadata[metadata_key]
+                    
+                    # Reassemble chunks
+                    i = 1
+                    while f'{metadata_key}_{i}' in metadata:
+                        b64_data += metadata[f'{metadata_key}_{i}']
+                        i += 1
+                        
+                    data = base64.b64decode(b64_data)
                     
                     # Cache it for future use
                     if not hasattr(self, '_pbs_metadata_cache'):
