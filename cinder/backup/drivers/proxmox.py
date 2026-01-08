@@ -917,8 +917,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         self._active_clients = {}
         self._backup_state = {}  # State for active backups: backup_id -> dict
         self._current_backup_id = None  # Track current backup being processed
-        self._backup_metadata = {}  # Store metadata files: backup_id -> {filename: data}
-        self._backup_metadata = {}  # Store metadata files: backup_id -> {filename: data}
+        self._pbs_metadata_cache = {}  # Store metadata files: backup_id -> {filename: data}
 
     def _validate_config(self):
         """Validate required configuration options."""
