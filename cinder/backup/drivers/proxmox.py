@@ -1005,6 +1005,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             'offsets': [],
             'csum': hashlib.sha256(),
             'expected_total_size': total_size,  # Track what we told PBS
+            'backup_time': backup_time,  # Store for service_metadata
+            'backup_id': backup_id,  # Store PBS backup_id
         }
 
         return super(ProxmoxBackupDriver, self)._prepare_backup(backup)
@@ -1040,7 +1042,19 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 # Complete backup
                 client.complete_backup()
 
-                LOG.info("PBS backup completed successfully")
+                # Save service metadata for restore
+                # This is critical - we need the exact backup_time used
+                service_metadata = {
+                    'backup_id': state['backup_id'],
+                    'backup_time': state['backup_time'],
+                    'archive_name': 'volume.fidx',
+                    'backup_type': 'vm',
+                }
+                backup.service_metadata = json.dumps(service_metadata)
+                backup.save()
+
+                LOG.info("PBS backup completed successfully. "
+                         "Saved service_metadata: %s", service_metadata)
             except Exception as e:
                 LOG.error(f"Error finishing PBS backup: {e}")
                 # Cleanup before re-raising
@@ -1233,31 +1247,38 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         client = self._get_client()
         client.authenticate()
 
-        backup_type = 'vm'
-        backup_id = f"volume-{backup.volume_id}"
-        # We need the backup time. If it's not in service_metadata,
-        # try logic from backup creation time.
-        backup_time = None
-
-        # Try to recover backup_time from service_metadata first
-        # (Though we haven't implemented service_metadata storage yet in backup()!)
-        # Fallback to backup.created_at
-        if backup.created_at:
-            backup_time = int(backup.created_at.timestamp())
-        else:
-            msg = _("Backup has no timestamp information")
+        # Get backup metadata from service_metadata
+        if not backup.service_metadata:
+            msg = _("Backup has no service_metadata. Cannot restore - "
+                    "backup may have been created with an older driver version.")
+            LOG.error(msg)
             raise exception.BackupDriverException(msg)
 
-        LOG.info(f"Starting restore for {backup_id} (time: {backup_time})")
+        try:
+            meta = json.loads(backup.service_metadata)
+        except (json.JSONDecodeError, TypeError) as e:
+            msg = _("Invalid service_metadata format: %s") % str(e)
+            LOG.error(msg)
+            raise exception.BackupDriverException(msg)
+
+        backup_type = meta.get('backup_type', 'vm')
+        backup_id = meta.get('backup_id', f"volume-{backup.volume_id}")
+        backup_time = meta.get('backup_time')
+        archive_name = meta.get('archive_name', 'volume.fidx')
+
+        if not backup_time:
+            msg = _("Missing backup_time in service_metadata")
+            LOG.error(msg)
+            raise exception.BackupDriverException(msg)
+
+        LOG.info("Starting restore for %s (time: %s)", backup_id, backup_time)
 
         try:
             # 2. Start restore session
             client.create_restore(CONF.backup_proxmox_datastore,
                                   backup_type, backup_id, backup_time)
 
-            # 3. Download Index
-            # We assume standard name 'volume.fidx'
-            archive_name = "volume.fidx"
+            # 3. Download Index (using archive_name from service_metadata)
             chunk_digests = client.download_index(archive_name)
 
             LOG.info(f"Downloaded index with {len(chunk_digests)} chunks")
