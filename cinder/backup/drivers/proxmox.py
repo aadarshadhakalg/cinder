@@ -540,7 +540,7 @@ class PBSClient:
 
     def upload_manifest(self, archive_name, size, csum):
         """Upload the backup manifest (index.json.blob).
-        
+
         :param archive_name: Archive filename (e.g., 'volume.fidx')
         :param size: Total size of the archive
         :param csum: Checksum of the archive
@@ -560,7 +560,7 @@ class PBSClient:
         }
 
         manifest_json = json.dumps(manifest, indent=2).encode()
-        
+
         # Wrap manifest in blob format
         chunk_handler = PBSChunk()
         manifest_blob = chunk_handler.encode(manifest_json)
@@ -586,24 +586,26 @@ class PBSClient:
         :param archive_name: Name of the index file (e.g. volume.fidx)
         :returns: List of chunk digests (hex strings)
         """
-        path = "/index"
+        # PBS reader protocol uses /download endpoint for file retrieval
+        path = "/download"
         params = {'file-name': archive_name}
 
         try:
             headers, data = self._h2_request('GET', path, params=params)
-            
+
             # Parse fixed index
             # Format: MAGIC (8 bytes) + ... + Digests (starts at 4096)
             HEADER_SIZE = 4096
             # Magic for fixed index
             MAGIC = bytes([47, 127, 65, 237, 145, 253, 15, 205])
-            
+
             if len(data) < HEADER_SIZE:
                 raise exception.BackupDriverException("Index file too short")
-                
+
             if data[:8] != MAGIC:
-                 raise exception.BackupDriverException("Invalid fixed index magic")
-                 
+                raise exception.BackupDriverException(
+                    "Invalid fixed index magic")
+
             digests = []
             offset = HEADER_SIZE
             # Each digest is 32 bytes
@@ -611,7 +613,7 @@ class PBSClient:
                 digest = data[offset:offset + 32]
                 digests.append(digest.hex())
                 offset += 32
-                
+
             return digests
 
         except Exception as e:
@@ -620,13 +622,13 @@ class PBSClient:
 
     def download_chunk(self, digest):
         """Download a chunk by its digest.
-        
+
         :param digest: Hex string digest
         :returns: Blob bytes
         """
         path = '/chunk'
         params = {'digest': digest}
-        
+
         try:
             headers, data = self._h2_request('GET', path, params=params)
             return data
@@ -639,20 +641,20 @@ class PBSClient:
         path = f"/api2/json/admin/datastore/{datastore}/snapshots/{backup_type}/{backup_id}/{backup_time}"
         url = self._build_url(path)
         headers = self._get_headers()
-        
+
         try:
             # We use the auth_session, but we need to add tokens in headers if not present
             # httpx Client merges headers, so we can pass them in the call
             response = self.auth_session.delete(url, headers=headers)
-            
+
             # 200 OK or 404 Not Found (already deleted) are acceptable
             if response.status_code == 404:
                 LOG.warning(f"Snapshot {path} not found for deletion")
                 return
-                
+
             response.raise_for_status()
             LOG.info(f"Deleted snapshot {path}")
-            
+
         except Exception as e:
             msg = _("Failed to delete snapshot: %s") % str(e)
             raise exception.BackupDriverException(msg)
@@ -711,17 +713,17 @@ class ObjectWriter:
     def close(self):
         """Finalize and upload the chunk."""
         data = self.buffer.getvalue()
-        
+
         if len(data) == 0:
             return
-            
+
         # For fixed index, all chunks except the last MUST be exactly chunk_size
         # If this chunk is less than chunk_size, we need to pad it with zeros
         # to make it a full chunk, UNLESS it's truly the last chunk
         if self.state is not None:
             chunk_size = len(data)
             original_size = chunk_size
-            
+
             # Check if this is smaller than the fixed chunk size
             if chunk_size < self.fixed_chunk_size:
                 # Pad with zeros to make it a full chunk
@@ -729,17 +731,18 @@ class ObjectWriter:
                 padding = b'\x00' * (self.fixed_chunk_size - chunk_size)
                 data = data + padding
                 chunk_size = self.fixed_chunk_size
-                
+
                 from oslo_log import log as logging
                 LOG = logging.getLogger(__name__)
-                LOG.debug(f"Padded chunk from {original_size} to {chunk_size} bytes")
-            
+                LOG.debug(
+                    f"Padded chunk from {original_size} to {chunk_size} bytes")
+
             # Wrap chunk in blob format
             chunk_data = self.chunk_handler.encode(data)
-            
+
             # Calculate digest from the padded chunk data
             digest = hashlib.sha256(data).hexdigest()
-            
+
             wid = self.state['wid']
 
             # Upload chunk (size = padded size, encoded_size = blob size)
@@ -763,76 +766,77 @@ class ObjectWriter:
 
 class MetadataWriter:
     """Writer for metadata files that persists data in backup object's metadata.
-    
+
     PBS manages its own metadata (index.json.blob), but Cinder needs
     SHA256 files for incremental backups. We store these in the backup
     object's metadata field in the database for persistence.
     """
-    
+
     def __init__(self, driver, backup_id, object_name):
         self.driver = driver
         self.backup_id = backup_id
         self.object_name = object_name
         self.buffer = io.BytesIO()
-    
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is None:
             self.close()
         return False
-    
+
     def write(self, data):
         """Store data in buffer."""
         self.buffer.write(data)
-    
+
     def close(self):
         """Persist metadata to database via backup object."""
         from cinder import db
         from cinder import context as cinder_context
-        
+
         data = self.buffer.getvalue()
-        
+
         # Also keep in memory cache for current session
         if not hasattr(self.driver, '_pbs_metadata_cache'):
             self.driver._pbs_metadata_cache = {}
         if self.backup_id not in self.driver._pbs_metadata_cache:
             self.driver._pbs_metadata_cache[self.backup_id] = {}
         self.driver._pbs_metadata_cache[self.backup_id][self.object_name] = data
-        
+
         # Persist to database
         try:
             # Get admin context to update backup metadata
             ctxt = cinder_context.get_admin_context()
             backup = db.backup_get(ctxt, self.backup_id)
-            
+
             # Get existing metadata or create new dict
             metadata = backup.get('metadata') or {}
             if not isinstance(metadata, dict):
                 metadata = {}
-            
+
             # Store the file data as base64 encoded string
             import base64
             b64_data = base64.b64encode(data).decode('utf-8')
-            
+
             # Split into 60KB chunks to fit in DB column
             chunk_size = 60000
-            chunks = [b64_data[i:i + chunk_size] for i in range(0, len(b64_data), chunk_size)]
-            
+            chunks = [b64_data[i:i + chunk_size]
+                      for i in range(0, len(b64_data), chunk_size)]
+
             # Store chunks
             if chunks:
                 metadata[f'pbs_meta_{self.object_name}'] = chunks[0]
                 for i in range(1, len(chunks)):
                     metadata[f'pbs_meta_{self.object_name}_{i}'] = chunks[i]
             else:
-                 metadata[f'pbs_meta_{self.object_name}'] = ""
+                metadata[f'pbs_meta_{self.object_name}'] = ""
 
             # Update backup with new metadata
             db.backup_metadata_update(ctxt, self.backup_id, metadata, False)
-            
+
             LOG.debug(f"Persisted metadata {self.object_name} ({len(data)} bytes) "
-                     f"to database for backup {self.backup_id}")
+                      f"to database for backup {self.backup_id}")
         except Exception as e:
             LOG.warning(f"Failed to persist metadata to database: {e}")
             # Continue - we still have it in memory cache for this session
@@ -840,16 +844,16 @@ class MetadataWriter:
 
 class MetadataReader:
     """Reader for metadata files stored in backup metadata."""
-    
+
     def __init__(self, data):
         self.data = data
-    
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         return False
-    
+
     def read(self):
         """Return the stored metadata."""
         return self.data
@@ -888,11 +892,11 @@ class ObjectReader:
 
 class PBSChunkReader:
     """Reader for PBS chunks."""
-    
+
     def __init__(self, client):
         self.chunk_handler = PBSChunk()
         self.client = client
-        
+
     def read_chunk(self, digest):
         """Download and decode a chunk."""
         blob_data = self.client.download_chunk(digest)
@@ -960,7 +964,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         """Prepare the backup."""
         # Track current backup
         self._current_backup_id = backup.id
-        
+
         # Start PBS session
         client = self._get_client()
         client.authenticate()
@@ -981,7 +985,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         # Calculate based on volume size, but this is the maximum size
         # The actual size will be determined when we close the index
         volume_size_bytes = backup.size * 1024 * 1024 * 1024  # GB to bytes
-        
+
         # Round up to nearest chunk size to ensure we have enough space
         chunk_size = CONF.backup_proxmox_chunk_size
         num_chunks = (volume_size_bytes + chunk_size - 1) // chunk_size
@@ -1035,7 +1039,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
                 # Complete backup
                 client.complete_backup()
-                
+
                 LOG.info("PBS backup completed successfully")
             except Exception as e:
                 LOG.error(f"Error finishing PBS backup: {e}")
@@ -1045,12 +1049,12 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 if backup.id in self._backup_state:
                     del self._backup_state[backup.id]
                 raise
-        
+
         # Now call parent's finalize - but mark that PBS is done
         # so get_object_writer knows to handle metadata differently
         if state:
             state['pbs_finalized'] = True
-        
+
         try:
             super(ProxmoxBackupDriver, self)._finalize_backup(backup, container,
                                                               object_meta, object_sha256)
@@ -1113,7 +1117,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         backup_id = extra_metadata.get('backup_id') if extra_metadata else None
         if not backup_id:
             backup_id = self._current_backup_id
-            
+
         client = self._active_clients.get(backup_id)
         state = self._backup_state.get(backup_id)
 
@@ -1126,7 +1130,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             # Return a metadata writer that stores data for incremental backups
             # PBS manages its own metadata, but we need SHA256 files for Cinder's incremental logic
             return MetadataWriter(self, backup_id, object_name)
-        
+
         # For volume data chunks, use ObjectWriter
         return ObjectWriter(client, container, object_name, state=state)
 
@@ -1134,50 +1138,52 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         """Get a reader for downloading an object."""
         from cinder import db
         from cinder import context as cinder_context
-        
+
         # Check if this is a metadata file request
         backup_id = extra_metadata.get('backup_id') if extra_metadata else None
-        
+
         if backup_id:
             # First check memory cache
             if hasattr(self, '_pbs_metadata_cache'):
                 metadata_dict = self._pbs_metadata_cache.get(backup_id, {})
                 if object_name in metadata_dict:
-                    LOG.debug(f"Retrieved metadata {object_name} from cache for backup {backup_id}")
+                    LOG.debug(
+                        f"Retrieved metadata {object_name} from cache for backup {backup_id}")
                     return MetadataReader(metadata_dict[object_name])
-            
+
             # Try to load from database
             try:
                 ctxt = cinder_context.get_admin_context()
                 backup = db.backup_get(ctxt, backup_id)
                 metadata = backup.get('metadata') or {}
-                
+
                 # Look for the metadata file
                 metadata_key = f'pbs_meta_{object_name}'
                 if metadata_key in metadata:
                     import base64
                     b64_data = metadata[metadata_key]
-                    
+
                     # Reassemble chunks
                     i = 1
                     while f'{metadata_key}_{i}' in metadata:
                         b64_data += metadata[f'{metadata_key}_{i}']
                         i += 1
-                        
+
                     data = base64.b64decode(b64_data)
-                    
+
                     # Cache it for future use
                     if not hasattr(self, '_pbs_metadata_cache'):
                         self._pbs_metadata_cache = {}
                     if backup_id not in self._pbs_metadata_cache:
                         self._pbs_metadata_cache[backup_id] = {}
                     self._pbs_metadata_cache[backup_id][object_name] = data
-                    
-                    LOG.debug(f"Retrieved metadata {object_name} from database for backup {backup_id}")
+
+                    LOG.debug(
+                        f"Retrieved metadata {object_name} from database for backup {backup_id}")
                     return MetadataReader(data)
             except Exception as e:
                 LOG.warning(f"Failed to load metadata from database: {e}")
-        
+
         # For actual backup data, would query PBS
         # For now, return empty reader (restore not implemented)
         client = self._get_client()
@@ -1226,21 +1232,21 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         # 1. Connect to PBS
         client = self._get_client()
         client.authenticate()
-        
+
         backup_type = 'vm'
         backup_id = f"volume-{backup.volume_id}"
-        # We need the backup time. If it's not in service_metadata, 
+        # We need the backup time. If it's not in service_metadata,
         # try logic from backup creation time.
         backup_time = None
-        
+
         # Try to recover backup_time from service_metadata first
         # (Though we haven't implemented service_metadata storage yet in backup()!)
         # Fallback to backup.created_at
         if backup.created_at:
-             backup_time = int(backup.created_at.timestamp())
+            backup_time = int(backup.created_at.timestamp())
         else:
-             msg = _("Backup has no timestamp information")
-             raise exception.BackupDriverException(msg)
+            msg = _("Backup has no timestamp information")
+            raise exception.BackupDriverException(msg)
 
         LOG.info(f"Starting restore for {backup_id} (time: {backup_time})")
 
@@ -1248,27 +1254,27 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             # 2. Start restore session
             client.create_restore(CONF.backup_proxmox_datastore,
                                   backup_type, backup_id, backup_time)
-            
+
             # 3. Download Index
             # We assume standard name 'volume.fidx'
             archive_name = "volume.fidx"
             chunk_digests = client.download_index(archive_name)
-            
+
             LOG.info(f"Downloaded index with {len(chunk_digests)} chunks")
-            
+
             # 4. Download and write chunks
             chunk_reader = PBSChunkReader(client)
-            
+
             for i, digest in enumerate(chunk_digests):
                 data = chunk_reader.read_chunk(digest)
                 volume_file.write(data)
-                
+
                 # Progress logging every 10% or so could be added here
                 if i > 0 and i % 100 == 0:
                     LOG.debug(f"Restored {i} / {len(chunk_digests)} chunks")
 
             LOG.info("Restore completed successfully")
-            
+
         except Exception as e:
             LOG.error(f"Restore failed: {e}")
             raise
@@ -1280,20 +1286,21 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         """Delete backup from PBS."""
         client = self._get_client()
         client.authenticate()
-        
+
         backup_type = 'vm'
         backup_id = f"volume-{backup.volume_id}"
         if backup.created_at:
-             backup_time = int(backup.created_at.timestamp())
+            backup_time = int(backup.created_at.timestamp())
         else:
-             LOG.warning("Cannot delete backup without timestamp")
-             return
+            LOG.warning("Cannot delete backup without timestamp")
+            return
 
         LOG.info(f"Deleting backup {backup_id} (time: {backup_time})")
-        
+
         # We don't need a backup session for deletion, just authenticated API call
         client.delete_snapshot(CONF.backup_proxmox_datastore,
                                backup_type, backup_id, backup_time)
+
 
 def get_backup_driver(context):
     """Return a Proxmox Backup driver instance.
