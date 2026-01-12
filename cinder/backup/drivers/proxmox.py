@@ -620,6 +620,28 @@ class PBSClient:
             msg = _("Failed to download index: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
+    def download_manifest(self):
+        """Download and parse the backup manifest (index.json.blob).
+
+        :returns: Dictionary with manifest data
+        """
+        path = "/download"
+        params = {'file-name': 'index.json.blob'}
+
+        try:
+            headers, blob_data = self._h2_request('GET', path, params=params)
+
+            # Decode the blob to get the JSON
+            chunk_handler = PBSChunk()
+            manifest_json = chunk_handler.decode(blob_data)
+            manifest = json.loads(manifest_json.decode())
+
+            return manifest
+
+        except Exception as e:
+            msg = _("Failed to download manifest: %s") % str(e)
+            raise exception.BackupDriverException(msg)
+
     def download_chunk(self, digest):
         """Download a chunk by its digest.
 
@@ -1278,23 +1300,52 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             client.create_restore(CONF.backup_proxmox_datastore,
                                   backup_type, backup_id, backup_time)
 
-            # 3. Download Index (using archive_name from service_metadata)
-            chunk_digests = client.download_index(archive_name)
+            # 3. Download manifest to get actual data size
+            manifest = client.download_manifest()
+            files = manifest.get('files', [])
+            if not files:
+                raise exception.BackupDriverException(
+                    "No files found in backup manifest")
 
+            # Get the actual size (without padding)
+            actual_size = files[0].get('size', 0)
+            LOG.info(f"Actual backup data size: {actual_size} bytes")
+
+            # 4. Download Index (using archive_name from service_metadata)
+            chunk_digests = client.download_index(archive_name)
             LOG.info(f"Downloaded index with {len(chunk_digests)} chunks")
 
-            # 4. Download and write chunks
+            # 5. Calculate chunk size and how much to write
+            chunk_size = CONF.backup_proxmox_chunk_size
+            total_written = 0
             chunk_reader = PBSChunkReader(client)
 
+            # 6. Download and write chunks
             for i, digest in enumerate(chunk_digests):
-                data = chunk_reader.read_chunk(digest)
-                volume_file.write(data)
+                chunk_data = chunk_reader.read_chunk(digest)
 
-                # Progress logging every 10% or so could be added here
+                # Calculate how much of this chunk to actually write
+                remaining = actual_size - total_written
+                bytes_to_write = min(len(chunk_data), remaining)
+
+                if bytes_to_write > 0:
+                    # Only write the actual data, not the padding
+                    volume_file.write(chunk_data[:bytes_to_write])
+                    total_written += bytes_to_write
+
+                # Progress logging
                 if i > 0 and i % 100 == 0:
-                    LOG.debug(f"Restored {i} / {len(chunk_digests)} chunks")
+                    progress = (total_written / actual_size *
+                                100) if actual_size > 0 else 0
+                    LOG.debug(f"Restored {i} / {len(chunk_digests)} chunks "
+                              f"({progress:.1f}% complete)")
 
-            LOG.info("Restore completed successfully")
+                # Stop if we've written all the data
+                if total_written >= actual_size:
+                    break
+
+            LOG.info(
+                f"Restore completed successfully. Wrote {total_written} bytes")
 
         except Exception as e:
             LOG.error(f"Restore failed: {e}")
