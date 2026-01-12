@@ -112,8 +112,11 @@ class PBSChunk:
     Reference: https://pbs.proxmox.com/docs/file-formats.html#data-blob-format
     """
 
-    # Data blob magic numbers (unencrypted, uncompressed)
+    # Data blob magic numbers
     MAGIC_UNCOMPRESSED = bytes([66, 171, 56, 7, 190, 131, 112, 161])
+    MAGIC_COMPRESSED = bytes([49, 185, 88, 66, 111, 182, 163, 127])
+    MAGIC_ENCRYPTED = bytes([57, 145, 165, 82, 132, 144, 161, 188])
+    MAGIC_ENCRYPTED_COMPRESSED = bytes([123, 103, 133, 190, 34, 45, 76, 240])
 
     def __init__(self):
         """Initialize chunk handler for fixed index."""
@@ -137,8 +140,26 @@ class PBSChunk:
         :param chunk_data: Blob-wrapped chunk bytes
         :returns: Decoded raw bytes
         """
-        # Skip magic (8 bytes) and CRC32 (4 bytes)
-        return chunk_data[12:]
+        if len(chunk_data) < 12:
+            raise ValueError("Blob data too short")
+
+        # Check magic to determine blob type
+        magic = chunk_data[:8]
+
+        if magic == self.MAGIC_UNCOMPRESSED:
+            # Uncompressed: MAGIC (8) + CRC32 (4) + Data
+            return chunk_data[12:]
+        elif magic == self.MAGIC_COMPRESSED:
+            # Compressed: MAGIC (8) + CRC32 (4) + Compressed Data
+            compressed_data = chunk_data[12:]
+            try:
+                return zlib.decompress(compressed_data)
+            except zlib.error as e:
+                raise ValueError(f"Failed to decompress blob: {e}")
+        elif magic == self.MAGIC_ENCRYPTED or magic == self.MAGIC_ENCRYPTED_COMPRESSED:
+            raise ValueError("Encrypted blobs are not supported")
+        else:
+            raise ValueError(f"Unknown blob magic: {magic.hex()}")
 
 
 class PBSClient:
@@ -631,15 +652,30 @@ class PBSClient:
         try:
             headers, blob_data = self._h2_request('GET', path, params=params)
 
+            LOG.debug(f"Downloaded manifest blob, size: {len(blob_data)} bytes, "
+                      f"magic: {blob_data[:8].hex() if len(blob_data) >= 8 else 'N/A'}")
+
             # Decode the blob to get the JSON
             chunk_handler = PBSChunk()
             manifest_json = chunk_handler.decode(blob_data)
-            manifest = json.loads(manifest_json.decode())
+
+            LOG.debug(f"Decoded manifest, size: {len(manifest_json)} bytes")
+
+            manifest = json.loads(manifest_json.decode('utf-8'))
 
             return manifest
 
+        except ValueError as e:
+            msg = _("Failed to decode manifest blob: %s") % str(e)
+            LOG.error(msg)
+            raise exception.BackupDriverException(msg)
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            msg = _("Failed to parse manifest JSON: %s") % str(e)
+            LOG.error(msg)
+            raise exception.BackupDriverException(msg)
         except Exception as e:
             msg = _("Failed to download manifest: %s") % str(e)
+            LOG.error(msg)
             raise exception.BackupDriverException(msg)
 
     def download_chunk(self, digest):
