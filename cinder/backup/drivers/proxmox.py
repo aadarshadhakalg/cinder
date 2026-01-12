@@ -1304,23 +1304,57 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 client.sock.close()
 
     def delete_backup(self, backup):
-        """Delete backup from PBS."""
+        """Delete backup from PBS.
+
+        This method is called when a backup is deleted from OpenStack dashboard.
+        It removes the backup snapshot from Proxmox Backup Server using the
+        exact backup_time that was stored during backup creation.
+
+        :param backup: Backup object to delete
+        """
+        # Extract PBS backup information from service_metadata
+        if not backup.service_metadata:
+            LOG.warning("No service_metadata found for backup %s, "
+                        "cannot delete from PBS", backup.id)
+            return
+
+        try:
+            service_metadata = json.loads(backup.service_metadata)
+        except (json.JSONDecodeError, TypeError) as e:
+            LOG.error("Failed to parse service_metadata for backup %s: %s",
+                      backup.id, str(e))
+            return
+
+        # Get PBS connection details from metadata
+        backup_id = service_metadata.get('backup_id')
+        backup_time = service_metadata.get('backup_time')
+        backup_type = service_metadata.get('backup_type', 'vm')
+
+        if not backup_id or not backup_time:
+            LOG.warning("Missing backup_id or backup_time in service_metadata "
+                        "for backup %s", backup.id)
+            return
+
+        LOG.info("Deleting backup from PBS: %s (time: %s)",
+                 backup_id, backup_time)
+
+        # Create PBS client and authenticate
         client = self._get_client()
         client.authenticate()
 
-        backup_type = 'vm'
-        backup_id = f"volume-{backup.volume_id}"
-        if backup.created_at:
-            backup_time = int(backup.created_at.timestamp())
-        else:
-            LOG.warning("Cannot delete backup without timestamp")
-            return
-
-        LOG.info(f"Deleting backup {backup_id} (time: {backup_time})")
-
-        # We don't need a backup session for deletion, just authenticated API call
-        client.delete_snapshot(CONF.backup_proxmox_datastore,
-                               backup_type, backup_id, backup_time)
+        # Delete the snapshot from PBS using the exact backup_time from metadata
+        try:
+            client.delete_snapshot(
+                CONF.backup_proxmox_datastore,
+                backup_type,
+                backup_id,
+                backup_time
+            )
+            LOG.info("Successfully deleted backup %s from PBS", backup.id)
+        except exception.BackupDriverException as e:
+            LOG.error("Failed to delete backup %s from PBS: %s",
+                      backup.id, str(e))
+            raise
 
 
 def get_backup_driver(context):
