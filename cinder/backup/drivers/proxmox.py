@@ -164,9 +164,15 @@ class PBSChunk:
             compressed_data = chunk_data[12:]
             try:
                 # PBS uses LZ4 block compression
-                return lz4.block.decompress(compressed_data, uncompressed_size=8 * 1024 * 1024)
+                # Don't specify uncompressed_size - let LZ4 allocate enough space
+                # For safety, we can specify a reasonable maximum size
+                return lz4.block.decompress(compressed_data, uncompressed_size=64 * 1024 * 1024)
             except Exception as e:
-                raise ValueError(f"Failed to decompress LZ4 blob: {e}")
+                # If that fails, try without size hint
+                try:
+                    return lz4.block.decompress(compressed_data)
+                except Exception as e2:
+                    raise ValueError(f"Failed to decompress LZ4 blob: {e2}")
         elif magic == self.MAGIC_ENCRYPTED or magic == self.MAGIC_ENCRYPTED_COMPRESSED:
             raise ValueError("Encrypted blobs are not supported")
         else:
