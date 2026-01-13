@@ -42,6 +42,7 @@ from urllib import parse as urlparse
 
 try:
     import lz4.block
+    import lz4.frame
     HAS_LZ4 = True
 except ImportError:
     HAS_LZ4 = False
@@ -140,7 +141,7 @@ class PBSChunk:
         :returns: Blob-wrapped chunk data
         """
         if HAS_LZ4:
-            compressed_data = lz4.block.compress(data, store_size=False)
+            compressed_data = lz4.frame.compress(data)
             crc = zlib.crc32(compressed_data)
             blob = self.MAGIC_COMPRESSED + struct.pack('<I', crc) + compressed_data
         else:
@@ -171,16 +172,18 @@ class PBSChunk:
 
             compressed_data = chunk_data[12:]
             try:
-                # PBS uses LZ4 block compression
-                # Don't specify uncompressed_size - let LZ4 allocate enough space
-                # For safety, we can specify a reasonable maximum size
-                return lz4.block.decompress(compressed_data, uncompressed_size=64 * 1024 * 1024)
-            except Exception as e:
-                # If that fails, try without size hint
+                # PBS might use Frames or Blocks. Try Frame first (standard)
+                return lz4.frame.decompress(compressed_data)
+            except Exception:
+                # Fallback to Block
                 try:
-                    return lz4.block.decompress(compressed_data)
+                    return lz4.block.decompress(compressed_data, uncompressed_size=64 * 1024 * 1024)
                 except Exception as e2:
-                    raise ValueError(f"Failed to decompress LZ4 blob: {e2}")
+                    # Try block without size hint as last resort
+                    try:
+                        return lz4.block.decompress(compressed_data)
+                    except Exception as e3:
+                        raise ValueError(f"Failed to decompress LZ4 blob: {e3}")
         elif magic == self.MAGIC_ENCRYPTED or magic == self.MAGIC_ENCRYPTED_COMPRESSED:
             raise ValueError("Encrypted blobs are not supported")
         else:
