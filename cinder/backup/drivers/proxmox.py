@@ -786,11 +786,11 @@ class ObjectWriter:
                 LOG.debug(
                     f"Padded chunk from {original_size} to {chunk_size} bytes")
 
-            # Wrap chunk in blob format
+            # Wrapper chunk in blob format
             chunk_data = self.chunk_handler.encode(data)
 
-            # Calculate digest from the encoded blob (PBS expects hash of the blob)
-            digest = hashlib.sha256(chunk_data).hexdigest()
+            # Calculate digest from the padded chunk data (Revert to original: hash of raw data)
+            digest = hashlib.sha256(data).hexdigest()
 
             wid = self.state['wid']
 
