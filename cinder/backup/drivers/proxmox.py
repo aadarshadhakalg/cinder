@@ -132,21 +132,15 @@ class PBSChunk:
         pass
 
     def encode(self, data):
-        """Wrap data in PBS blob format.
+        """Wrap data in PBS blob format (unencrypted, uncompressed).
 
-        If LZ4 is available, compresses data.
-        Format: MAGIC (8 bytes) + CRC32 (4 bytes) + [Compressed] Data
+        Format: MAGIC (8 bytes) + CRC32 (4 bytes) + Data
 
         :param data: Raw bytes to store
         :returns: Blob-wrapped chunk data
         """
-        if HAS_LZ4:
-            compressed_data = lz4.frame.compress(data)
-            crc = zlib.crc32(compressed_data)
-            blob = self.MAGIC_COMPRESSED + struct.pack('<I', crc) + compressed_data
-        else:
-            crc = zlib.crc32(data)
-            blob = self.MAGIC_UNCOMPRESSED + struct.pack('<I', crc) + data
+        crc = zlib.crc32(data)
+        blob = self.MAGIC_UNCOMPRESSED + struct.pack('<I', crc) + data
         return blob
 
     def decode(self, chunk_data):
@@ -825,8 +819,9 @@ class ObjectWriter:
             # Wrapper chunk in blob format
             chunk_data = self.chunk_handler.encode(data)
 
-            # Calculate digest from the encoded blob (PBS expects hash of the blob)
-            digest = hashlib.sha256(chunk_data).hexdigest()
+            # Calculate digest from the padded chunk data (Revert to original: hash of raw data)
+            # For uncompressed chunks, PBS expects the digest of the raw payload
+            digest = hashlib.sha256(data).hexdigest()
 
             wid = self.state['wid']
 
