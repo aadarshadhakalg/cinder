@@ -49,7 +49,7 @@ except ImportError:
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import timeutils
-import requests
+
 import httpx
 import h2.connection
 import h2.config
@@ -60,6 +60,8 @@ from cinder import exception
 from cinder.i18n import _
 from cinder import interface
 from cinder.utils import retry
+from cinder import db
+from cinder import context as cinder_context
 
 LOG = logging.getLogger(__name__)
 
@@ -770,8 +772,8 @@ class ObjectWriter:
         self.buffer = io.BytesIO()
         self.state = state
         # Get the fixed chunk size from config (default 4MB)
-        from oslo_config import cfg
-        self.fixed_chunk_size = cfg.CONF.backup_proxmox_chunk_size
+        # Get the fixed chunk size from config (default 4MB)
+        self.fixed_chunk_size = CONF.backup_proxmox_chunk_size
 
     def __enter__(self):
         return self
@@ -807,16 +809,15 @@ class ObjectWriter:
                 data = data + padding
                 chunk_size = self.fixed_chunk_size
 
-                from oslo_log import log as logging
-                LOG = logging.getLogger(__name__)
+
                 LOG.debug(
                     f"Padded chunk from {original_size} to {chunk_size} bytes")
 
             # Wrap chunk in blob format
             chunk_data = self.chunk_handler.encode(data)
 
-            # Calculate digest from the padded chunk data
-            digest = hashlib.sha256(data).hexdigest()
+            # Calculate digest from the encoded blob (PBS expects hash of the blob)
+            digest = hashlib.sha256(chunk_data).hexdigest()
 
             wid = self.state['wid']
 
@@ -867,8 +868,7 @@ class MetadataWriter:
 
     def close(self):
         """Persist metadata to database via backup object."""
-        from cinder import db
-        from cinder import context as cinder_context
+
 
         data = self.buffer.getvalue()
 
@@ -891,7 +891,6 @@ class MetadataWriter:
                 metadata = {}
 
             # Store the file data as base64 encoded string
-            import base64
             b64_data = base64.b64encode(data).decode('utf-8')
 
             # Split into 60KB chunks to fit in DB column
@@ -1225,8 +1224,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def get_object_reader(self, container, object_name, extra_metadata=None):
         """Get a reader for downloading an object."""
-        from cinder import db
-        from cinder import context as cinder_context
+        """Get a reader for downloading an object."""
 
         # Check if this is a metadata file request
         backup_id = extra_metadata.get('backup_id') if extra_metadata else None
