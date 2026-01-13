@@ -40,11 +40,7 @@ import time
 import zlib
 from urllib import parse as urlparse
 
-try:
-    import lz4.block
-    HAS_LZ4 = True
-except ImportError:
-    HAS_LZ4 = False
+
 
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -122,9 +118,6 @@ class PBSChunk:
 
     # Data blob magic numbers
     MAGIC_UNCOMPRESSED = bytes([66, 171, 56, 7, 190, 131, 112, 161])
-    MAGIC_COMPRESSED = bytes([49, 185, 88, 66, 111, 182, 163, 127])
-    MAGIC_ENCRYPTED = bytes([57, 145, 165, 82, 132, 144, 161, 188])
-    MAGIC_ENCRYPTED_COMPRESSED = bytes([123, 103, 133, 190, 34, 45, 76, 240])
 
     def __init__(self):
         """Initialize chunk handler for fixed index."""
@@ -157,26 +150,6 @@ class PBSChunk:
         if magic == self.MAGIC_UNCOMPRESSED:
             # Uncompressed: MAGIC (8) + CRC32 (4) + Data
             return chunk_data[12:]
-        elif magic == self.MAGIC_COMPRESSED:
-            # Compressed with LZ4: MAGIC (8) + CRC32 (4) + LZ4 Compressed Data
-            if not HAS_LZ4:
-                raise ValueError(
-                    "LZ4 library not available. Install python-lz4: pip install lz4")
-
-            compressed_data = chunk_data[12:]
-            try:
-                # PBS uses LZ4 block compression
-                # Don't specify uncompressed_size - let LZ4 allocate enough space
-                # For safety, we can specify a reasonable maximum size
-                return lz4.block.decompress(compressed_data, uncompressed_size=64 * 1024 * 1024)
-            except Exception as e:
-                # If that fails, try without size hint
-                try:
-                    return lz4.block.decompress(compressed_data)
-                except Exception as e2:
-                    raise ValueError(f"Failed to decompress LZ4 blob: {e2}")
-        elif magic == self.MAGIC_ENCRYPTED or magic == self.MAGIC_ENCRYPTED_COMPRESSED:
-            raise ValueError("Encrypted blobs are not supported")
         else:
             raise ValueError(f"Unknown blob magic: {magic.hex()}")
 
