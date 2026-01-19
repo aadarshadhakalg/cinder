@@ -28,27 +28,23 @@
 :backup_proxmox_chunk_size: Size of backup chunks in bytes (default: 4MB).
 """
 
-import base64
 import hashlib
-import hmac
 import io
 import json
+import re
 import struct
 import time
 import zlib
-from urllib import parse as urlparse
 
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import timeutils
-import requests
 import httpx
 
 from cinder.backup import chunkeddriver
 from cinder import exception
 from cinder.i18n import _
 from cinder import interface
-from cinder.utils import retry
 
 LOG = logging.getLogger(__name__)
 
@@ -102,87 +98,225 @@ CONF.register_opts(proxmoxbackup_service_opts)
 
 class PBSDataBlob:
     """Handler for Proxmox Backup Server data blob encoding/decoding.
-    
+
     PBS stores data in a specific blob format with magic numbers and CRC checks.
     This class implements the encoding and decoding logic.
+
+    From pbs-datastore/src/file_formats.rs:
+    - UNCOMPRESSED_BLOB_MAGIC_1_0: [66, 171, 56, 7, 190, 131, 112, 161]
+    - COMPRESSED_BLOB_MAGIC_1_0: [49, 185, 88, 66, 111, 182, 163, 127]
+    - ENCRYPTED_BLOB_MAGIC_1_0: [123, 103, 133, 190, 34, 45, 76, 240]
+    - ENCR_COMPR_BLOB_MAGIC_1_0: [230, 89, 27, 191, 11, 191, 216, 11]
     """
-    
-    # Magic numbers for different blob types
-    # https://pbs.proxmox.com/docs/file-formats.html#data-blob-format
-    # [66, 171, 56, 7, 190, 131, 112, 161] -> 0xA17083BE0738AB42 (Little Endian)
-    UNENCRYPTED_BLOB_MAGIC_1_0 = 0xA17083BE0738AB42
-    ENCRYPTED_BLOB_MAGIC_1_0 = 0x0107_5670_ac7a_c806    # Encrypted (TODO: Verify)
-    COMPRESSED_BLOB_MAGIC_1_0 = 0x0107_5670_ac7a_c807   # Compressed (TODO: Verify)
-    ENCR_COMPR_BLOB_MAGIC_1_0 = 0x0107_5670_ac7a_c808  # Encrypted+Compressed (TODO: Verify)
-    
+
+    # Magic numbers from PBS Rust source (little-endian byte arrays)
+    UNCOMPRESSED_BLOB_MAGIC_1_0 = bytes([66, 171, 56, 7, 190, 131, 112, 161])
+    COMPRESSED_BLOB_MAGIC_1_0 = bytes([49, 185, 88, 66, 111, 182, 163, 127])
+    ENCRYPTED_BLOB_MAGIC_1_0 = bytes([123, 103, 133, 190, 34, 45, 76, 240])
+    ENCR_COMPR_BLOB_MAGIC_1_0 = bytes([230, 89, 27, 191, 11, 191, 216, 11])
+
     def __init__(self, compress=False, encrypt=False):
         """Initialize blob handler.
-        
+
         :param compress: Whether to compress the data
         :param encrypt: Whether to encrypt the data (not yet implemented)
         """
         self.compress = compress
         self.encrypt = encrypt
-        
+
     def encode(self, data):
         """Encode data into PBS blob format.
-        
+
         :param data: Raw bytes to encode
         :returns: Encoded blob bytes
         """
         if self.encrypt:
             raise NotImplementedError("Encryption not yet implemented")
-            
+
         # Determine magic number based on compression
         if self.compress:
             compressed = zlib.compress(data)
             magic = self.COMPRESSED_BLOB_MAGIC_1_0
             payload = compressed
         else:
-            magic = self.UNENCRYPTED_BLOB_MAGIC_1_0
+            magic = self.UNCOMPRESSED_BLOB_MAGIC_1_0
             payload = data
-            
-        # Calculate CRC32
-        crc = struct.unpack('<I', struct.pack('<I', 0xffffffff ^ 
-              zlib.crc32(payload) ^ 0xffffffff))[0]
-        
+
+        # Calculate CRC32 (standard zlib crc32)
+        crc = zlib.crc32(payload) & 0xffffffff
+
         # Build blob: magic(8) + crc(4) + data
-        blob = struct.pack('<Q', magic) + struct.pack('<I', crc) + payload
-        
+        blob = magic + struct.pack('<I', crc) + payload
+
         return blob
-        
+
     def decode(self, blob):
         """Decode PBS blob format to raw data.
-        
+
         :param blob: Blob bytes to decode
         :returns: Decoded raw bytes
         """
         if len(blob) < 12:
             raise ValueError("Blob too small")
-            
+
         # Parse header
-        magic = struct.unpack('<Q', blob[0:8])[0]
+        magic = blob[0:8]
         crc_expected = struct.unpack('<I', blob[8:12])[0]
         payload = blob[12:]
-        
+
         # Verify CRC
-        crc_actual = struct.unpack('<I', struct.pack('<I', 0xffffffff ^ 
-                     zlib.crc32(payload) ^ 0xffffffff))[0]
+        crc_actual = zlib.crc32(payload) & 0xffffffff
         if crc_actual != crc_expected:
             raise ValueError(f"CRC mismatch: expected {crc_expected}, "
                            f"got {crc_actual}")
-        
-        # Decompress if needed
+
+        # Decompress if needed based on magic
         if magic == self.COMPRESSED_BLOB_MAGIC_1_0:
             return zlib.decompress(payload)
-        elif magic == self.UNENCRYPTED_BLOB_MAGIC_1_0:
+        elif magic == self.UNCOMPRESSED_BLOB_MAGIC_1_0:
             return payload
         elif magic == self.ENCRYPTED_BLOB_MAGIC_1_0:
             raise NotImplementedError("Encrypted blobs not yet supported")
         elif magic == self.ENCR_COMPR_BLOB_MAGIC_1_0:
             raise NotImplementedError("Encrypted compressed blobs not supported")
         else:
-            raise ValueError(f"Unknown blob magic: {hex(magic)}")
+            raise ValueError(f"Unknown blob magic: {magic.hex()}")
+
+
+class DynamicIndexReader:
+    """Reader for PBS Dynamic Index (.didx) files.
+
+    Dynamic Index format (from pbs-datastore/src/dynamic_index.rs):
+    - Header: 4096 bytes
+      - magic: 8 bytes [28, 145, 78, 165, 25, 186, 179, 205]
+      - uuid: 16 bytes
+      - ctime: i64 (8 bytes)
+      - index_csum: 32 bytes (SHA256 of all entries)
+      - reserved: 4032 bytes
+    - Entries: 40 bytes each
+      - end_le: u64 (8 bytes) - end offset of this chunk
+      - digest: 32 bytes - SHA256 digest of the chunk
+    """
+
+    HEADER_SIZE = 4096
+    ENTRY_SIZE = 40  # 8 bytes offset + 32 bytes digest
+    MAGIC = bytes([28, 145, 78, 165, 25, 186, 179, 205])
+
+    def __init__(self, data):
+        """Initialize from raw index data.
+
+        :param data: Raw bytes of the .didx file
+        """
+        if len(data) < self.HEADER_SIZE:
+            raise ValueError("Dynamic index too small for header")
+
+        # Parse header
+        magic = data[0:8]
+        if magic != self.MAGIC:
+            raise ValueError(f"Invalid dynamic index magic: {magic.hex()}")
+
+        self.uuid = data[8:24]
+        self.ctime = struct.unpack('<q', data[24:32])[0]
+        self.index_csum = data[32:64]
+
+        # Parse entries
+        self.entries = []
+        entry_data = data[self.HEADER_SIZE:]
+        num_entries = len(entry_data) // self.ENTRY_SIZE
+
+        for i in range(num_entries):
+            offset = i * self.ENTRY_SIZE
+            end_offset = struct.unpack('<Q', entry_data[offset:offset + 8])[0]
+            digest = entry_data[offset + 8:offset + 40]
+            self.entries.append({
+                'end_offset': end_offset,
+                'digest': digest,
+                'digest_hex': digest.hex()
+            })
+
+        LOG.debug(f"Parsed dynamic index with {len(self.entries)} chunks")
+
+    def get_chunk_digests(self):
+        """Return list of chunk digests in order."""
+        return [e['digest'] for e in self.entries]
+
+    def get_chunk_digest_hexes(self):
+        """Return list of chunk digest hex strings in order."""
+        return [e['digest_hex'] for e in self.entries]
+
+    def get_total_size(self):
+        """Return total size of the indexed data."""
+        if self.entries:
+            return self.entries[-1]['end_offset']
+        return 0
+
+
+class FixedIndexReader:
+    """Reader for PBS Fixed Index (.fidx) files.
+
+    Fixed Index format (from pbs-datastore/src/fixed_index.rs):
+    - Header: 4096 bytes
+      - magic: 8 bytes [47, 127, 65, 237, 145, 253, 15, 205]
+      - uuid: 16 bytes
+      - ctime: i64 (8 bytes)
+      - index_csum: 32 bytes (SHA256 of all digests)
+      - size: u64 (8 bytes) - total image size
+      - chunk_size: u64 (8 bytes)
+      - reserved: 4016 bytes
+    - Digests: 32 bytes each (consecutive SHA256 digests)
+    """
+
+    HEADER_SIZE = 4096
+    DIGEST_SIZE = 32
+    MAGIC = bytes([47, 127, 65, 237, 145, 253, 15, 205])
+
+    def __init__(self, data):
+        """Initialize from raw index data.
+
+        :param data: Raw bytes of the .fidx file
+        """
+        if len(data) < self.HEADER_SIZE:
+            raise ValueError("Fixed index too small for header")
+
+        # Parse header
+        magic = data[0:8]
+        if magic != self.MAGIC:
+            raise ValueError(f"Invalid fixed index magic: {magic.hex()}")
+
+        self.uuid = data[8:24]
+        self.ctime = struct.unpack('<q', data[24:32])[0]
+        self.index_csum = data[32:64]
+        self.size = struct.unpack('<Q', data[64:72])[0]
+        self.chunk_size = struct.unpack('<Q', data[72:80])[0]
+
+        # Parse digests
+        self.digests = []
+        digest_data = data[self.HEADER_SIZE:]
+        num_digests = len(digest_data) // self.DIGEST_SIZE
+
+        for i in range(num_digests):
+            offset = i * self.DIGEST_SIZE
+            digest = digest_data[offset:offset + 32]
+            self.digests.append(digest)
+
+        LOG.debug(f"Parsed fixed index: {len(self.digests)} chunks, "
+                 f"chunk_size={self.chunk_size}, total_size={self.size}")
+
+    def get_chunk_digests(self):
+        """Return list of chunk digests in order."""
+        return self.digests
+
+    def get_chunk_digest_hexes(self):
+        """Return list of chunk digest hex strings in order."""
+        return [d.hex() for d in self.digests]
+
+    def get_total_size(self):
+        """Return total size of the indexed data."""
+        return self.size
+
+    def get_chunk_size(self):
+        """Return the fixed chunk size."""
+        return self.chunk_size
 
 
 class PBSClient:
@@ -327,21 +461,30 @@ class PBSClient:
 
     def upload_blob(self, name, data):
         """Upload a named blob (config, manifest, etc).
-        
-        :param name: Blob name (e.g. 'cinder-manifest.json')
-        :param data: Blob data (bytes)
+
+        :param name: Blob name (e.g. 'cinder-manifest.json.blob')
+        :param data: Blob data (raw bytes, will be encoded as PBS blob)
         """
         url = self._build_url("/blob")
         headers = self._get_headers()
         headers['Content-Type'] = 'application/octet-stream'
-        
+
+        # Encode the data as a PBS blob
+        blob_handler = PBSDataBlob(compress=False)
+        encoded_data = blob_handler.encode(data)
+
+        # PBS expects the file name to end with .blob
+        if not name.endswith('.blob'):
+            name = name + '.blob'
+
         params = {
             'file-name': name,
-            'encoded-size': len(data)
+            'encoded-size': len(encoded_data)
         }
-        
+
         try:
-            self.session.post(url, content=data, params=params, headers=headers).raise_for_status()
+            self.session.post(url, content=encoded_data, params=params,
+                            headers=headers).raise_for_status()
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             raise exception.BackupDriverException(f"Failed to upload blob {name}: {e}")
 
@@ -417,20 +560,43 @@ class PBSClient:
             raise exception.BackupDriverException(msg)
 
     def download_blob_direct(self, datastore, backup_type, backup_id, backup_time, name):
-        """Download blob using REST API."""
-        path = f"/api2/json/admin/datastore/{datastore}/snapshots/{backup_type}/{backup_id}/{backup_time}/download"
+        """Download blob/file using REST API.
+
+        :param datastore: Datastore name
+        :param backup_type: Backup type (e.g., 'host')
+        :param backup_id: Backup ID
+        :param backup_time: Backup timestamp (integer epoch)
+        :param name: File name to download
+        :returns: File content (decoded if it's a blob)
+        """
+        # Use the download endpoint with backup identification params
+        path = f"/api2/json/admin/datastore/{datastore}/download"
         url = self._build_url(path)
-        params = {'file-name': name}
+        params = {
+            'backup-type': backup_type,
+            'backup-id': backup_id,
+            'backup-time': int(backup_time),
+            'file-name': name,
+        }
         headers = self._get_headers()
-        
+
         try:
             response = self.session.get(url, params=params, headers=headers)
             response.raise_for_status()
-            return response.content
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            content = response.content
+
+            # If this is a .blob file, it needs to be decoded
+            if name.endswith('.blob'):
+                blob_handler = PBSDataBlob()
+                return blob_handler.decode(content)
+            return content
+        except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 return None
-            msg = _("Failed to download blob %s: %s") % (name, str(e))
+            msg = _("Failed to download file %s: %s") % (name, str(e))
+            raise exception.BackupDriverException(msg)
+        except httpx.RequestError as e:
+            msg = _("Failed to download file %s: %s") % (name, str(e))
             raise exception.BackupDriverException(msg)
 
     def download_chunk(self, datastore, digest):
@@ -456,13 +622,233 @@ class PBSClient:
         
     def download_index(self, name):
         """Download an index file.
-        
+
         :param name: Index filename
         :returns: Index data
         """
         # This would use HTTP/2 GET /download
         LOG.debug(f"Would download index {name}")
         return b''
+
+    def start_reader_session(self, datastore, backup_type, backup_id,
+                             backup_time, namespace=None):
+        """Start a reader session for restoring backups.
+
+        This initiates a connection that can be used to download index files
+        and chunks from a specific backup snapshot.
+
+        :param datastore: Datastore name
+        :param backup_type: Backup type (e.g., 'host')
+        :param backup_id: Backup ID
+        :param backup_time: Backup timestamp (integer epoch)
+        :param namespace: Optional namespace
+        :returns: PBSReaderSession instance
+        """
+        return PBSReaderSession(
+            self, datastore, backup_type, backup_id, backup_time, namespace
+        )
+
+
+class PBSReaderSession:
+    """Session for reading/restoring data from PBS using the reader protocol.
+
+    The PBS reader protocol is accessed via HTTP/2 after upgrading from
+    HTTP/1.1 with the header 'Upgrade: proxmox-backup-reader-protocol-v1'.
+
+    Since httpx doesn't support protocol upgrades in the same way as the Rust
+    client, we use the standard REST API endpoints which provide equivalent
+    functionality for reading backup data.
+
+    API endpoints used:
+    - GET /api2/json/admin/datastore/{store}/download-decoded
+      Downloads and decodes files from a backup snapshot
+    - GET /api2/json/admin/datastore/{store}/pxar-file-download
+      Downloads files from pxar archives (not used here)
+    """
+
+    def __init__(self, client, datastore, backup_type, backup_id,
+                 backup_time, namespace=None):
+        """Initialize reader session.
+
+        :param client: PBSClient instance (authenticated)
+        :param datastore: Datastore name
+        :param backup_type: Backup type (e.g., 'host')
+        :param backup_id: Backup ID
+        :param backup_time: Backup timestamp
+        :param namespace: Optional namespace
+        """
+        self.client = client
+        self.datastore = datastore
+        self.backup_type = backup_type
+        self.backup_id = backup_id
+        self.backup_time = int(backup_time)
+        self.namespace = namespace
+        self.blob_handler = PBSDataBlob()
+        self._index_cache = {}
+        self._chunk_cache = {}
+
+    def _get_backup_params(self):
+        """Get common backup identification parameters."""
+        params = {
+            'backup-type': self.backup_type,
+            'backup-id': self.backup_id,
+            'backup-time': self.backup_time,
+        }
+        if self.namespace:
+            params['ns'] = self.namespace
+        return params
+
+    def download_file(self, filename):
+        """Download a file from the backup snapshot.
+
+        :param filename: Name of the file to download (e.g., 'volume.didx')
+        :returns: Raw file content
+        """
+        url = self.client._build_url(
+            f"/api2/json/admin/datastore/{self.datastore}/download"
+        )
+        headers = self.client._get_headers()
+        params = self._get_backup_params()
+        params['file-name'] = filename
+
+        try:
+            response = self.client.session.get(
+                url, params=params, headers=headers
+            )
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                LOG.warning(f"File {filename} not found in backup")
+                return None
+            msg = _("Failed to download file %s: %s") % (filename, str(e))
+            raise exception.BackupDriverException(msg)
+        except httpx.RequestError as e:
+            msg = _("Failed to download file %s: %s") % (filename, str(e))
+            raise exception.BackupDriverException(msg)
+
+    def download_decoded_file(self, filename):
+        """Download a file with automatic decoding (blob unwrapping).
+
+        :param filename: Name of the file to download
+        :returns: Decoded file content
+        """
+        url = self.client._build_url(
+            f"/api2/json/admin/datastore/{self.datastore}/download-decoded"
+        )
+        headers = self.client._get_headers()
+        params = self._get_backup_params()
+        params['file-name'] = filename
+
+        try:
+            response = self.client.session.get(
+                url, params=params, headers=headers
+            )
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                LOG.warning(f"File {filename} not found in backup")
+                return None
+            msg = _("Failed to download decoded file %s: %s") % (filename, str(e))
+            raise exception.BackupDriverException(msg)
+        except httpx.RequestError as e:
+            msg = _("Failed to download decoded file %s: %s") % (filename, str(e))
+            raise exception.BackupDriverException(msg)
+
+    def download_index(self, index_name):
+        """Download and parse an index file.
+
+        :param index_name: Index filename (e.g., 'volume.didx')
+        :returns: DynamicIndexReader or FixedIndexReader instance
+        """
+        if index_name in self._index_cache:
+            return self._index_cache[index_name]
+
+        data = self.download_file(index_name)
+        if data is None:
+            raise exception.BackupDriverException(
+                _("Index file %s not found") % index_name
+            )
+
+        if index_name.endswith('.didx'):
+            index = DynamicIndexReader(data)
+        elif index_name.endswith('.fidx'):
+            index = FixedIndexReader(data)
+        else:
+            raise exception.BackupDriverException(
+                _("Unknown index type: %s") % index_name
+            )
+
+        self._index_cache[index_name] = index
+        return index
+
+    def download_chunk(self, digest_hex):
+        """Download a single chunk by its digest.
+
+        :param digest_hex: Hex-encoded SHA256 digest of the chunk
+        :returns: Decoded chunk data (raw bytes)
+        """
+        if digest_hex in self._chunk_cache:
+            return self._chunk_cache[digest_hex]
+
+        url = self.client._build_url(
+            f"/api2/json/admin/datastore/{self.datastore}/chunk"
+        )
+        headers = self.client._get_headers()
+        params = {'digest': digest_hex}
+
+        try:
+            response = self.client.session.get(
+                url, params=params, headers=headers
+            )
+            response.raise_for_status()
+            blob_data = response.content
+        except httpx.HTTPStatusError as e:
+            msg = _("Failed to download chunk %s: %s") % (digest_hex, str(e))
+            raise exception.BackupDriverException(msg)
+        except httpx.RequestError as e:
+            msg = _("Failed to download chunk %s: %s") % (digest_hex, str(e))
+            raise exception.BackupDriverException(msg)
+
+        # Decode the blob
+        decoded = self.blob_handler.decode(blob_data)
+        self._chunk_cache[digest_hex] = decoded
+        return decoded
+
+    def read_index_data(self, index_name, output_file=None):
+        """Read all data from an index file by downloading all chunks.
+
+        :param index_name: Index filename (e.g., 'volume.didx')
+        :param output_file: Optional file-like object to write data to
+        :returns: Complete data as bytes (if output_file is None)
+        """
+        index = self.download_index(index_name)
+        digests = index.get_chunk_digest_hexes()
+
+        LOG.info(f"Restoring {len(digests)} chunks from {index_name}")
+
+        if output_file is None:
+            data = io.BytesIO()
+        else:
+            data = output_file
+
+        for i, digest_hex in enumerate(digests):
+            chunk_data = self.download_chunk(digest_hex)
+            data.write(chunk_data)
+            if (i + 1) % 100 == 0:
+                LOG.debug(f"Restored {i + 1}/{len(digests)} chunks")
+
+        LOG.info(f"Completed restoring {len(digests)} chunks")
+
+        if output_file is None:
+            return data.getvalue()
+        return None
+
+    def close(self):
+        """Close the reader session and clear caches."""
+        self._index_cache.clear()
+        self._chunk_cache.clear()
 
 
 class ObjectWriter:
@@ -502,22 +888,23 @@ class ObjectWriter:
         """Finalize and upload the object."""
         data = self.buffer.getvalue()
         original_size = len(data)
-        
-        # Encode as PBS blob
+
+        # Calculate digest of the RAW data (before encoding)
+        # PBS uses the raw data digest to identify chunks
+        digest = hashlib.sha256(data).hexdigest()
+
+        # Encode as PBS blob for storage/transport
         blob = self.blob_handler.encode(data)
-        
-        # Calculate digest of the BLOB
-        digest = hashlib.sha256(blob).hexdigest()
-        
+
         # Upload to PBS
         if self.state is not None:
             wid = self.state['wid']
             self.client.upload_chunk(wid, digest, blob, original_size, len(blob))
-            
+
             # Update stats and checksum for dynamic index
             self.state['chunk_count'] += 1
             self.state['total_size'] += original_size
-            
+
             # Checksum: SHA256(offset_le || digest_bytes)
             # offset is the END offset of the chunk
             offset_bytes = struct.pack('<Q', self.state['total_size'])
@@ -527,22 +914,32 @@ class ObjectWriter:
         else:
             # Fallback for non-indexed uploads (shouldn't happen for chunks)
             pass
-        
-        # Update manifest
+
+        # Update manifest with raw data digest
         if self.manifest is not None:
             self.manifest[self.name] = digest
 
 
 class ObjectReader:
-    """Reader for PBS objects (chunks/blobs)."""
-    
+    """Reader for individual PBS objects (chunks).
+
+    This class handles reading a single backup object from PBS by:
+    1. Looking up the object's PBS digest from the Cinder manifest
+    2. Downloading and decoding that specific chunk from PBS
+
+    The Cinder chunked driver stores each chunk as a separate object with a
+    unique name. During backup, we store a mapping of object_name -> PBS digest
+    in a manifest blob. During restore, we look up each object's digest and
+    download it individually.
+    """
+
     def __init__(self, client, datastore, name, extra_metadata=None, driver=None):
         """Initialize reader.
-        
+
         :param client: PBSClient instance
         :param datastore: Datastore name
-        :param name: Object name
-        :param extra_metadata: Metadata containing digest
+        :param name: Object name to read
+        :param extra_metadata: Metadata containing backup info (volume_id, backup_time)
         :param driver: ProxmoxBackupDriver instance (for manifest lookup)
         """
         self.client = client
@@ -550,30 +947,73 @@ class ObjectReader:
         self.name = name
         self.extra_metadata = extra_metadata or {}
         self.driver = driver
-        self.blob_handler = PBSDataBlob()
         self.data = None
-        
+        self.blob_handler = PBSDataBlob()
+
     def __enter__(self):
-        digest = None
-        # Try to get digest from manifest via driver
-        if self.driver:
-            digest = self.driver.get_object_digest(self.name, self.extra_metadata)
-            
-        if not digest:
-             # Fallback to extra_metadata if available
-             digest = self.extra_metadata.get('pbs_digest')
-             
-        if not digest:
-            LOG.warning(f"No digest found for {self.name}, cannot download")
+        # Get backup identification from extra_metadata
+        volume_id = self.extra_metadata.get('volume_id')
+        backup_time = self.extra_metadata.get('backup_time')
+
+        if not volume_id or not backup_time:
+            LOG.error("Missing volume_id or backup_time in extra_metadata, "
+                     "cannot restore object %s", self.name)
             return self
-            
-        blob = self.client.download_chunk_direct(self.datastore, digest)
-        self.data = self.blob_handler.decode(blob)
+
+        LOG.debug(f"Reading object {self.name} from PBS")
+
+        try:
+            # Authenticate client if needed
+            self.client.authenticate()
+
+            # Get the PBS digest for this object from the manifest
+            digest = None
+            if self.driver:
+                digest = self.driver.get_object_digest(self.name, self.extra_metadata)
+
+            if not digest:
+                LOG.error(f"No PBS digest found for object {self.name}")
+                return self
+
+            LOG.debug(f"Object {self.name} has PBS digest {digest}")
+
+            # Download the chunk from PBS
+            url = self.client._build_url(
+                f"/api2/json/admin/datastore/{self.datastore}/chunk"
+            )
+            headers = self.client._get_headers()
+            params = {'digest': digest}
+
+            response = self.client.session.get(
+                url, params=params, headers=headers
+            )
+            response.raise_for_status()
+            blob_data = response.content
+
+            # Decode the blob to get raw data
+            self.data = self.blob_handler.decode(blob_data)
+
+            LOG.debug(f"Successfully read {len(self.data)} bytes for object {self.name}")
+
+        except httpx.HTTPStatusError as e:
+            msg = _("Failed to download object %s: %s") % (self.name, str(e))
+            LOG.error(msg)
+            raise exception.BackupDriverException(msg)
+        except httpx.RequestError as e:
+            msg = _("Failed to download object %s: %s") % (self.name, str(e))
+            LOG.error(msg)
+            raise exception.BackupDriverException(msg)
+        except Exception as e:
+            LOG.exception(f"Failed to read object {self.name}: {e}")
+            raise exception.BackupDriverException(
+                _("Failed to restore object %s: %s") % (self.name, str(e))
+            )
+
         return self
-        
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         return False
-        
+
     def read(self):
         """Read the object data."""
         return self.data if self.data is not None else b''
@@ -761,42 +1201,136 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                           state=state)
         
     def get_object_reader(self, container, object_name, extra_metadata=None):
-        """Get a reader for downloading an object."""
+        """Get a reader for downloading an object.
+
+        If extra_metadata is not provided, we try to extract backup info
+        from the object_name which follows the pattern:
+        volume_{volume_id}/{timestamp}/az_{az}_backup_{backup_id}...
+        """
+        # If extra_metadata not provided, try to extract from object_name
+        if extra_metadata is None:
+            extra_metadata = self._extract_backup_info_from_name(object_name)
+
         client = self._get_client()
         return ObjectReader(client, container, object_name, extra_metadata, driver=self)
+
+    def _extract_backup_info_from_name(self, object_name):
+        """Extract backup identification from object name.
+
+        Object names follow the pattern:
+        volume_{volume_id}/{timestamp}/az_{az}_backup_{backup_id}...
+
+        :param object_name: The object name to parse
+        :returns: dict with volume_id, backup_id, backup_time or empty dict
+        """
+        try:
+            # Parse volume_id from path
+            volume_match = re.search(r'volume_([a-f0-9-]+)', object_name)
+            backup_match = re.search(r'backup_([a-f0-9-]+)', object_name)
+
+            if not volume_match or not backup_match:
+                LOG.warning(f"Could not parse backup info from object name: {object_name}")
+                return {}
+
+            volume_id = volume_match.group(1)
+            backup_id = backup_match.group(1)
+
+            # Check if we have cached info for this backup
+            if backup_id in self._manifests:
+                # We already have the manifest, but need backup_time
+                pass
+
+            # Try to look up the backup from database to get created_at
+            try:
+                from cinder import objects
+                backup = objects.Backup.get_by_id(self.context, backup_id)
+                if backup and backup.created_at:
+                    backup_time = int(backup.created_at.timestamp())
+                    return {
+                        'volume_id': volume_id,
+                        'backup_id': backup_id,
+                        'backup_time': backup_time,
+                        'namespace': CONF.backup_proxmox_namespace,
+                    }
+            except Exception as e:
+                LOG.debug(f"Could not look up backup {backup_id}: {e}")
+
+            # Return partial info - manifest lookup might still work
+            return {
+                'volume_id': volume_id,
+                'backup_id': backup_id,
+            }
+        except Exception as e:
+            LOG.warning(f"Error extracting backup info from {object_name}: {e}")
+            return {}
+        
+    def delete_object(self, container, object_name):
+        """Delete object from PBS datastore.
+        
+        For PBS, individual objects (chunks) are managed automatically
+        by the server via garbage collection. We only need to delete
+        complete backup snapshots.
+        """
+        # PBS manages chunk deletion via garbage collection
+        # Individual object deletion is not supported/needed
+        LOG.debug(f"Delete object {object_name} requested - PBS manages chunks via GC")
+        pass
+        
+    def _generate_object_name_prefix(self, backup):
+        """Generate object name prefix for backup.
+        
+        PBS uses a different naming structure (backup-type/backup-id/timestamp)
+        but we still need to provide this for compatibility with the parent class.
+        """
+        az = 'az_%s' % self.az
+        backup_name = '%s_backup_%s' % (az, backup.id)
+        volume = 'volume_%s' % (backup.volume_id)
+        timestamp = timeutils.utcnow().strftime("%Y%m%d%H%M%S")
+        prefix = volume + '/' + timestamp + '/' + backup_name
+        LOG.debug('generate_object_name_prefix: %s', prefix)
+        return prefix
         
     def get_object_digest(self, object_name, extra_metadata):
-        """Get PBS digest for an object from manifest."""
+        """Get PBS digest for an object from manifest.
+
+        :param object_name: Cinder object name to look up
+        :param extra_metadata: Metadata containing backup identification
+        :returns: PBS chunk digest (hex string) or None
+        """
         backup_id = extra_metadata.get('backup_id')
         if not backup_id:
             return None
-            
+
         # Check cache
         if backup_id in self._manifests:
             return self._manifests[backup_id].get(object_name)
-            
+
         # Download manifest
         client = self._get_client()
+        client.authenticate()
         datastore = CONF.backup_proxmox_datastore
         backup_type = 'host'
         pbs_backup_id = f"volume-{extra_metadata.get('volume_id')}"
         backup_time = extra_metadata.get('backup_time')
-        
+
         if not backup_time:
             LOG.warning("No backup_time in metadata, cannot download manifest")
             return None
-            
+
         try:
-            data = client.download_blob_direct(datastore, backup_type, 
-                                             pbs_backup_id, backup_time, 
-                                             "cinder-manifest.json")
+            # The manifest is stored as cinder-manifest.json.blob
+            data = client.download_blob_direct(datastore, backup_type,
+                                             pbs_backup_id, backup_time,
+                                             "cinder-manifest.json.blob")
             if data:
-                manifest = json.loads(data)
+                # data is already decoded by download_blob_direct for .blob files
+                manifest = json.loads(data.decode('utf-8'))
                 self._manifests[backup_id] = manifest
+                LOG.debug(f"Loaded manifest with {len(manifest)} entries")
                 return manifest.get(object_name)
         except Exception as e:
             LOG.warning(f"Failed to download manifest: {e}")
-            
+
         return None
 
     def update_container_name(self, backup, container):
