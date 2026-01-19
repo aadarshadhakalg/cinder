@@ -30,7 +30,6 @@
 
 import base64
 import hashlib
-import hmac
 import io
 import json
 import socket
@@ -38,7 +37,6 @@ import ssl
 import struct
 import time
 import zlib
-from urllib import parse as urlparse
 
 try:
     import lz4.block
@@ -1251,7 +1249,6 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 # Look for the metadata file
                 metadata_key = f'pbs_meta_{object_name}'
                 if metadata_key in metadata:
-                    import base64
                     b64_data = metadata[metadata_key]
 
                     # Reassemble chunks
