@@ -1,17 +1,17 @@
 # Copyright (C) 2025 Aadarsha Dhakal <aadarsha.dhakal@startsml.com>
 # All Rights Reserved.
 #
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
-# not use this file except in compliance with the License. You may obtain
-# a copy of the License at
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#         http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# License for the specific language governing permissions and limitations
-# under the License.
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
 
 """Implementation of a backup service using Proxmox Backup Server (PBS)
 
@@ -35,22 +35,11 @@ import re
 import struct
 import time
 import zlib
-from urllib import parse as urlparse
-
-try:
-    import lz4.block
-    import lz4.frame
-    HAS_LZ4 = True
-except ImportError:
-    HAS_LZ4 = False
 
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import timeutils
 import httpx
-import h2.connection
-import h2.config
-import h2.events
 
 from cinder.backup import chunkeddriver
 from cinder import exception
@@ -354,12 +343,9 @@ class PBSClient:
         self.base_url = f"https://{host}:{port}"
         self.ticket = None
         self.csrf_token = None
-        # HTTP/1.1 session for authentication only
-        self.auth_session = httpx.Client(verify=verify_ssl, timeout=60.0)
-        # HTTP/2 connection (after upgrade)
-        self.h2_conn = None
-        self.sock = None
-        self.backup_session = None
+        # Disable verify for now if configured, but ideally use a context
+        self.session = httpx.Client(
+            http2=True, verify=verify_ssl, timeout=60.0)
 
     def _build_url(self, path):
         """Build full URL for API endpoint."""
@@ -375,7 +361,7 @@ class PBSClient:
         }
 
         try:
-            response = self.auth_session.post(auth_url, data=data)
+            response = self.session.post(auth_url, data=data)
             response.raise_for_status()
 
             result = response.json()
@@ -403,261 +389,81 @@ class PBSClient:
         }
 
     def create_backup(self, datastore, backup_type, backup_id, backup_time):
-        """Start a backup session and upgrade to HTTP/2 backup protocol.
+        """Start a backup session.
 
         :param datastore: Datastore name
         :param backup_type: Backup type (e.g., 'host')
         :param backup_id: Backup ID
         :param backup_time: Backup timestamp (integer epoch)
         """
-        # Create raw socket connection
-        sock = socket.create_connection((self.host, self.port))
+        path = "/api2/json/backup"
+        params = {
+            'store': datastore,
+            'backup-type': backup_type,
+            'backup-id': backup_id,
+            'backup-time': int(backup_time),
+            'benchmark': 'false'
+        }
 
-        # Wrap with SSL
-        context = ssl.create_default_context()
-        if not self.verify_ssl:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-        self.sock = context.wrap_socket(sock, server_hostname=self.host)
-
-        # Send HTTP/1.1 upgrade request
+        url = self._build_url(path)
         headers = self._get_headers()
-        upgrade_request = (
-            f"GET /api2/json/backup?"
-            f"store={datastore}&"
-            f"backup-type={backup_type}&"
-            f"backup-id={backup_id}&"
-            f"backup-time={int(backup_time)}&"
-            f"benchmark=false HTTP/1.1\r\n"
-            f"Host: {self.host}:{self.port}\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Upgrade: proxmox-backup-protocol-v1\r\n"
-            f"Cookie: {headers['Cookie']}\r\n"
-            f"CSRFPreventionToken: {headers['CSRFPreventionToken']}\r\n"
-            f"\r\n"
-        )
+        # Required to upgrade to backup protocol
+        headers['Upgrade'] = 'proxmox-backup-protocol-v1'
 
         try:
-            LOG.debug("Sending HTTP/1.1 upgrade request to PBS")
-            self.sock.sendall(upgrade_request.encode())
-
-            # Read upgrade response
-            response = b""
-            while b"\r\n\r\n" not in response:
-                chunk = self.sock.recv(4096)
-                if not chunk:
-                    raise exception.BackupDriverException(
-                        _("Connection closed before upgrade complete"))
-                response += chunk
-
-            response_str = response.decode()
-
-            if "101 Switching Protocols" not in response_str:
-                raise exception.BackupDriverException(
-                    _("Upgrade failed: %s") % response_str)
-
-            LOG.debug("HTTP/2 upgrade successful (101 Switching Protocols)")
-
-            # Initialize H2 connection
-            config = h2.config.H2Configuration(client_side=True)
-            self.h2_conn = h2.connection.H2Connection(config=config)
-            self.h2_conn.initiate_connection()
-            self.sock.sendall(self.h2_conn.data_to_send())
-
-            LOG.debug("HTTP/2 connection initialized")
-
-            # Store backup session info
-            self.backup_session = {
-                'store': datastore,
-                'backup-type': backup_type,
-                'backup-id': backup_id,
-                'backup-time': int(backup_time),
-            }
-
+            # We use the existing session which should be HTTP/2 enabled
+            response = self.session.get(url, params=params, headers=headers)
+            response.raise_for_status()
             LOG.info(
                 f"Started PBS backup session for {backup_type}/{backup_id}")
-
-        except Exception as e:
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
             msg = _("Failed to start PBS backup session: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
-    def create_restore(self, datastore, backup_type, backup_id, backup_time):
-        """Start a restore session and upgrade to HTTP/2 reader protocol.
+    def create_dynamic_index(self, name):
+        """Create a new dynamic index (archive).
 
-        :param datastore: Datastore name
-        :param backup_type: Backup type
-        :param backup_id: Backup ID
-        :param backup_time: Backup timestamp
-        """
-        # Create raw socket connection
-        sock = socket.create_connection((self.host, self.port))
-
-        # Wrap with SSL
-        context = ssl.create_default_context()
-        if not self.verify_ssl:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-        self.sock = context.wrap_socket(sock, server_hostname=self.host)
-
-        # Send HTTP/1.1 upgrade request
-        headers = self._get_headers()
-        # Note: Reader protocol uses /api2/json/reader
-        upgrade_request = (
-            f"GET /api2/json/reader?"
-            f"store={datastore}&"
-            f"backup-type={backup_type}&"
-            f"backup-id={backup_id}&"
-            f"backup-time={int(backup_time)}&"
-            f"debug=true HTTP/1.1\r\n"
-            f"Host: {self.host}:{self.port}\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Upgrade: proxmox-backup-reader-protocol-v1\r\n"
-            f"Cookie: {headers['Cookie']}\r\n"
-            f"CSRFPreventionToken: {headers['CSRFPreventionToken']}\r\n"
-            f"\r\n"
-        )
-
-        try:
-            LOG.debug("Sending HTTP/1.1 upgrade request (reader) to PBS")
-            self.sock.sendall(upgrade_request.encode())
-
-            # Read upgrade response
-            response = b""
-            while b"\r\n\r\n" not in response:
-                chunk = self.sock.recv(4096)
-                if not chunk:
-                    raise exception.BackupDriverException(
-                        _("Connection closed before upgrade complete"))
-                response += chunk
-
-            response_str = response.decode()
-
-            if "101 Switching Protocols" not in response_str:
-                raise exception.BackupDriverException(
-                    _("Upgrade failed: %s") % response_str)
-
-            LOG.debug("HTTP/2 upgrade successful (101 Switching Protocols)")
-
-            # Initialize H2 connection
-            config = h2.config.H2Configuration(client_side=True)
-            self.h2_conn = h2.connection.H2Connection(config=config)
-            self.h2_conn.initiate_connection()
-            self.sock.sendall(self.h2_conn.data_to_send())
-
-            LOG.debug("HTTP/2 connection initialized (Restore Session)")
-
-            # Store backup session info
-            self.backup_session = {
-                'store': datastore,
-                'backup-type': backup_type,
-                'backup-id': backup_id,
-                'backup-time': int(backup_time),
-            }
-
-        except Exception as e:
-            if self.sock:
-                self.sock.close()
-                self.sock = None
-            msg = _("Failed to start PBS restore session: %s") % str(e)
-            raise exception.BackupDriverException(msg)
-
-    def _h2_request(self, method, path, params=None, body=None,
-                    content_type='application/octet-stream'):
-        """Make an HTTP/2 request over the upgraded connection."""
-        if not self.h2_conn:
-            raise exception.BackupDriverException(
-                _("Not connected - call create_backup first"))
-
-        # Build query string
-        query_string = ""
-        if params:
-            query_parts = [f"{k}={v}" for k, v in params.items()]
-            query_string = "?" + "&".join(query_parts)
-
-        # Prepare headers
-        headers = [
-            (':method', method),
-            (':path', path + query_string),
-            (':scheme', 'https'),
-            (':authority', f'{self.host}:{self.port}'),
-        ]
-
-        if body:
-            headers.append(('content-length', str(len(body))))
-            headers.append(('content-type', content_type))
-
-        # Send request
-        stream_id = self.h2_conn.get_next_available_stream_id()
-        self.h2_conn.send_headers(
-            stream_id, headers, end_stream=(body is None))
-
-        if body:
-            # Send body in chunks to respect max frame size
-            max_frame_size = self.h2_conn.max_outbound_frame_size
-            offset = 0
-            while offset < len(body):
-                chunk_size = min(max_frame_size, len(body) - offset)
-                chunk = body[offset:offset + chunk_size]
-                end_stream = (offset + chunk_size >= len(body))
-                self.h2_conn.send_data(stream_id, chunk, end_stream=end_stream)
-                offset += chunk_size
-
-        self.sock.sendall(self.h2_conn.data_to_send())
-
-        # Receive response
-        response_headers = {}
-        response_data = b""
-
-        while True:
-            data = self.sock.recv(65536)
-            if not data:
-                break
-
-            events = self.h2_conn.receive_data(data)
-            self.sock.sendall(self.h2_conn.data_to_send())
-
-            for event in events:
-                if isinstance(event, h2.events.ResponseReceived):
-                    response_headers = dict(event.headers)
-                elif isinstance(event, h2.events.DataReceived):
-                    response_data += event.data
-                    self.h2_conn.acknowledge_received_data(
-                        event.flow_controlled_length, event.stream_id)
-                elif isinstance(event, h2.events.StreamEnded):
-                    # Check status code
-                    status = response_headers.get(b':status', b'000').decode()
-                    if not status.startswith('2'):
-                        error_msg = response_data.decode() if response_data else 'No error message'
-                        raise exception.BackupDriverException(
-                            _("HTTP %(status)s: %(msg)s") % {
-                                'status': status, 'msg': error_msg})
-                    return response_headers, response_data
-
-        return response_headers, response_data
-
-    def create_fixed_index(self, archive_name, size):
-        """Create a new fixed index.
-
-        :param archive_name: Archive name (e.g. 'volume.fidx')
-        :param size: Total size of the archive
+        :param name: Archive name (e.g. 'volume.didx')
         :returns: Writer ID (wid)
         """
-        path = "/fixed_index"
+        url = self._build_url("/dynamic_index")
+        headers = self._get_headers()
+        # Archive-Name is passed as a parameter, not header
+        params = {'archive-name': name}
+
+        try:
+            response = self.session.post(url, params=params, headers=headers)
+            response.raise_for_status()
+            # Response is a JSON integer (wid)
+            return int(response.json())
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
+            raise exception.BackupDriverException(
+                f"Failed to create index {name}: {e}")
+
+    def close_dynamic_index(self, wid, chunk_count, size, csum):
+        """Close the currently open dynamic index.
+
+        :param wid: Writer ID
+        :param chunk_count: Number of chunks
+        :param size: Total size of data
+        :param csum: Checksum of the index (hex string)
+        """
+        url = self._build_url("/dynamic_close")
+        headers = self._get_headers()
+
         params = {
-            'archive-name': archive_name,
+            'wid': wid,
+            'chunk-count': chunk_count,
             'size': size,
+            'csum': csum
         }
 
         try:
-            headers, data = self._h2_request('POST', path, params=params)
-            # Parse response - should be JSON with 'data' field
-            result = json.loads(data.decode())
-            wid = int(result['data'])
-            LOG.debug(f"Created fixed index, wid: {wid}")
-            return wid
-        except Exception as e:
-            msg = _("Failed to create fixed index: %s") % str(e)
-            raise exception.BackupDriverException(msg)
+            self.session.post(url, params=params,
+                              headers=headers).raise_for_status()
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            raise exception.BackupDriverException(
+                f"Failed to close index: {e}")
 
     def upload_blob(self, name, data):
         """Upload a named blob (config, manifest, etc).
@@ -689,131 +495,79 @@ class PBSClient:
             raise exception.BackupDriverException(
                 f"Failed to upload blob {name}: {e}")
 
-    def append_index(self, digest_list, offset_list, wid):
-        """Append chunks to fixed index.
+    def download_blob(self, name):
+        """Download a named blob.
 
-        :param digest_list: List of chunk digests
-        :param offset_list: List of chunk offsets
-        :param wid: Writer ID
+        :param name: Blob name
+        :returns: Blob data
         """
-        path = "/fixed_index"
-
-        # Build JSON body
-        body_data = json.dumps({
-            'wid': wid,
-            'digest-list': digest_list,
-            'offset-list': offset_list,
-        }).encode()
+        url = self._build_url("/blob")
+        headers = self._get_headers()
+        headers['FileName'] = name
 
         try:
-            headers, data = self._h2_request(
-                'PUT', path, body=body_data, content_type='application/json')
-        except Exception as e:
-            msg = _("Failed to append to fixed index: %s") % str(e)
-            raise exception.BackupDriverException(msg)
+            response = self.session.get(url, headers=headers)
+            response.raise_for_status()
+            return response.content
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            # If not found, return None or raise?
+            if e.response.status_code == 404:
+                return None
+            raise exception.BackupDriverException(
+                f"Failed to download blob {name}: {e}")
 
-    def close_fixed_index(self, chunk_count, csum, size, wid):
-        """Close the fixed index.
+    def upload_chunk(self, wid, digest, data, size, encoded_size):
+        """Upload a chunk to PBS.
 
-        :param chunk_count: Number of chunks
-        :param csum: Checksum of the index (hex string)
-        :param size: Total size of data
         :param wid: Writer ID
+        :param digest: SHA256 digest of the chunk
+        :param data: Chunk data (blob)
+        :param size: Original size of the chunk (before compression/encryption)
+        :param encoded_size: Size of the encoded blob
         """
-        path = "/fixed_close"
+        url = self._build_url("/dynamic_chunk")
+        headers = self._get_headers()
+        headers['Content-Type'] = 'application/octet-stream'
+
         params = {
-            'chunk-count': chunk_count,
-            'csum': csum,
+            'wid': wid,
+            'digest': digest,
             'size': size,
-            'wid': wid,
+            'encoded-size': encoded_size
         }
 
         try:
-            headers, data = self._h2_request('POST', path, params=params)
-        except Exception as e:
-            msg = _("Failed to close fixed index: %s") % str(e)
+            response = self.session.post(
+                url, content=data, params=params, headers=headers)
+            response.raise_for_status()
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            msg = _("Failed to upload chunk to PBS: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
-    def upload_manifest(self, archive_name, size, csum):
-        """Upload the backup manifest (index.json.blob).
-
-        :param archive_name: Archive filename (e.g., 'volume.fidx')
-        :param size: Total size of the archive
-        :param csum: Checksum of the archive
-        """
-        # Create manifest
-        manifest = {
-            "backup-type": self.backup_session['backup-type'],
-            "backup-id": self.backup_session['backup-id'],
-            "backup-time": self.backup_session['backup-time'],
-            "files": [
-                {
-                    "filename": archive_name,
-                    "size": size,
-                    "csum": csum,
-                }
-            ],
-        }
-
-        manifest_json = json.dumps(manifest, indent=2).encode()
-
-        # Wrap manifest in blob format
-        chunk_handler = PBSChunk()
-        manifest_blob = chunk_handler.encode(manifest_json)
-
-        # Upload as index.json.blob
-        path = "/blob"
-        params = {
-            'file-name': 'index.json.blob',
-            'encoded-size': len(manifest_blob),
-        }
+    def finish_backup(self):
+        """Finish the backup and commit."""
+        url = self._build_url("/finish")
+        headers = self._get_headers()
 
         try:
-            headers, data = self._h2_request(
-                'POST', path, params=params, body=manifest_blob)
-            LOG.debug("Uploaded manifest (index.json.blob)")
-        except Exception as e:
-            msg = _("Failed to upload manifest: %s") % str(e)
-            raise exception.BackupDriverException(msg)
+            self.session.post(url, headers=headers).raise_for_status()
+            LOG.info("PBS backup finished successfully")
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            raise exception.BackupDriverException(
+                f"Failed to finish backup: {e}")
 
-    def download_index(self, archive_name):
-        """Download and parse the fixed index file.
-
-        :param archive_name: Name of the index file (e.g. volume.fidx)
-        :returns: List of chunk digests (hex strings)
-        """
-        # PBS reader protocol uses /download endpoint for file retrieval
-        path = "/download"
-        params = {'file-name': archive_name}
+    def download_chunk_direct(self, datastore, digest):
+        """Download chunk using REST API (no session)."""
+        url = self._build_url(
+            f"/api2/json/admin/datastore/{datastore}/chunk/{digest}")
+        headers = self._get_headers()
 
         try:
-            headers, data = self._h2_request('GET', path, params=params)
-
-            # Parse fixed index
-            # Format: MAGIC (8 bytes) + ... + Digests (starts at 4096)
-            HEADER_SIZE = 4096
-            # Magic for fixed index
-            MAGIC = bytes([47, 127, 65, 237, 145, 253, 15, 205])
-
-            if len(data) < HEADER_SIZE:
-                raise exception.BackupDriverException("Index file too short")
-
-            if data[:8] != MAGIC:
-                raise exception.BackupDriverException(
-                    "Invalid fixed index magic")
-
-            digests = []
-            offset = HEADER_SIZE
-            # Each digest is 32 bytes
-            while offset + 32 <= len(data):
-                digest = data[offset:offset + 32]
-                digests.append(digest.hex())
-                offset += 32
-
-            return digests
-
-        except Exception as e:
-            msg = _("Failed to download index: %s") % str(e)
+            response = self.session.get(url, headers=headers)
+            response.raise_for_status()
+            return response.content
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            msg = _("Failed to download chunk %s: %s") % (digest, str(e))
             raise exception.BackupDriverException(msg)
 
     def download_blob_direct(self, datastore, backup_type, backup_id, backup_time, name):
@@ -856,43 +610,25 @@ class PBSClient:
             msg = _("Failed to download file %s: %s") % (name, str(e))
             raise exception.BackupDriverException(msg)
 
-    def download_chunk(self, digest):
-        """Download a chunk by its digest.
+    def download_chunk(self, datastore, digest):
+        """Download a chunk from PBS.
 
-        :param digest: Hex string digest
-        :returns: Blob bytes
+        :param datastore: Datastore name
+        :param digest: SHA256 digest of the chunk
+        :returns: Chunk data (PBS blob encoded)
         """
-        path = '/chunk'
-        params = {'digest': digest}
-
-        try:
-            headers, data = self._h2_request('GET', path, params=params)
-            return data
-        except Exception as e:
-            msg = _("Failed to download chunk %s: %s") % (digest, str(e))
-            raise exception.BackupDriverException(msg)
-
-    def delete_snapshot(self, datastore, backup_type, backup_id, backup_time):
-        """Delete a snapshot using the API."""
-        path = f"/api2/json/admin/datastore/{datastore}/snapshots/{backup_type}/{backup_id}/{backup_time}"
-        url = self._build_url(path)
+        url = self._build_url("/fixed_chunk")
         headers = self._get_headers()
+        headers['Upload-Image-Store'] = datastore
+        headers['Upload-Chunk-Digest'] = digest
 
         try:
-            # We use the auth_session, but we need to add tokens in headers if not present
-            # httpx Client merges headers, so we can pass them in the call
-            response = self.auth_session.delete(url, headers=headers)
-
-            # 200 OK or 404 Not Found (already deleted) are acceptable
-            if response.status_code == 404:
-                LOG.warning(f"Snapshot {path} not found for deletion")
-                return
-
+            # Assuming GET request with headers for download
+            response = self.session.get(url, headers=headers)
             response.raise_for_status()
-            LOG.info(f"Deleted snapshot {path}")
-
-        except Exception as e:
-            msg = _("Failed to delete snapshot: %s") % str(e)
+            return response.content
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            msg = _("Failed to download chunk from PBS: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
     def download_index(self, name):
@@ -1129,25 +865,25 @@ class PBSReaderSession:
 
 
 class ObjectWriter:
-    """Writer for PBS objects (chunks) for fixed index."""
+    """Writer for PBS objects (chunks/blobs)."""
 
-    def __init__(self, client, datastore, name, state=None):
+    def __init__(self, client, datastore, name, manifest=None, compress=False, state=None):
         """Initialize writer.
 
         :param client: PBSClient instance
         :param datastore: Datastore name
         :param name: Object name
+        :param manifest: Dictionary to store object->digest mapping
+        :param compress: Whether to compress data
         :param state: Shared state dict for the backup session
         """
         self.client = client
         self.datastore = datastore
         self.name = name
-        self.chunk_handler = PBSChunk()
+        self.manifest = manifest
+        self.blob_handler = PBSDataBlob(compress=compress)
         self.buffer = io.BytesIO()
         self.state = state
-        # Get the fixed chunk size from config (default 4MB)
-        # Get the fixed chunk size from config (default 4MB)
-        self.fixed_chunk_size = CONF.backup_proxmox_chunk_size
 
     def __enter__(self):
         return self
@@ -1162,7 +898,7 @@ class ObjectWriter:
         self.buffer.write(data)
 
     def close(self):
-        """Finalize and upload the chunk."""
+        """Finalize and upload the object."""
         data = self.buffer.getvalue()
         original_size = len(data)
 
@@ -1175,27 +911,6 @@ class ObjectWriter:
 
         # Upload to PBS
         if self.state is not None:
-            chunk_size = len(data)
-            original_size = chunk_size
-
-            # Check if this is smaller than the fixed chunk size
-            if chunk_size < self.fixed_chunk_size:
-                # Pad with zeros to make it a full chunk
-                # PBS will track the actual data size separately
-                padding = b'\x00' * (self.fixed_chunk_size - chunk_size)
-                data = data + padding
-                chunk_size = self.fixed_chunk_size
-
-                LOG.debug(
-                    f"Padded chunk from {original_size} to {chunk_size} bytes")
-
-            # Wrapper chunk in blob format
-            chunk_data = self.chunk_handler.encode(data)
-
-            # Calculate digest from the padded chunk data (Revert to original: hash of raw data)
-            # For uncompressed chunks, PBS expects the digest of the raw payload
-            digest = hashlib.sha256(data).hexdigest()
-
             wid = self.state['wid']
             self.client.upload_chunk(
                 wid, digest, blob, original_size, len(blob))
@@ -1208,6 +923,7 @@ class ObjectWriter:
             # offset is the END offset of the chunk
             offset_bytes = struct.pack('<Q', self.state['total_size'])
             digest_bytes = bytes.fromhex(digest)
+            self.state['csum'].update(offset_bytes)
             self.state['csum'].update(digest_bytes)
         else:
             # Fallback for non-indexed uploads (shouldn't happen for chunks)
@@ -1233,7 +949,6 @@ class ObjectReader:
 
     def __init__(self, client, datastore, name, extra_metadata=None, driver=None):
         """Initialize reader.
-
 
         :param client: PBSClient instance
         :param datastore: Datastore name
@@ -1320,31 +1035,18 @@ class ObjectReader:
         return self.data if self.data is not None else b''
 
 
-class PBSChunkReader:
-    """Reader for PBS chunks."""
-
-    def __init__(self, client):
-        self.chunk_handler = PBSChunk()
-        self.client = client
-
-    def read_chunk(self, digest):
-        """Download and decode a chunk."""
-        blob_data = self.client.download_chunk(digest)
-        return self.chunk_handler.decode(blob_data)
-
-
 @interface.backupdriver
 class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     """Backup driver for Proxmox Backup Server.
 
     This driver implements native PBS protocol communication without
-    relying on the proxmox - backup - client command - line tool.
+    relying on the proxmox-backup-client command-line tool.
     """
 
     def __init__(self, context):
         """Initialize the Proxmox Backup driver.
 
-        : param context: The security context
+        :param context: The security context
         """
         chunk_size = CONF.backup_proxmox_chunk_size
         sha_block_size = CONF.backup_proxmox_block_size
@@ -1362,8 +1064,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         self._validate_config()
         self._active_clients = {}
         self._backup_state = {}  # State for active backups: backup_id -> dict
-        self._current_backup_id = None  # Track current backup being processed
-        self._pbs_metadata_cache = {}  # Store metadata files: backup_id -> {filename: data}
+        self._manifests = {}  # Cache for manifests: backup_id -> dict
+        self._backup_manifests = {}  # Manifests being built: backup_id -> dict
 
     def _validate_config(self):
         """Validate required configuration options."""
@@ -1392,15 +1094,12 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def _prepare_backup(self, backup):
         """Prepare the backup."""
-        # Track current backup
-        self._current_backup_id = backup.id
-
         # Start PBS session
         client = self._get_client()
         client.authenticate()
 
-        # Use 'vm' type for generic data
-        backup_type = 'vm'
+        # Use 'host' type for generic data
+        backup_type = 'host'
         backup_id = f"volume-{backup.volume_id}"
         # Use created_at timestamp for consistency
         if backup.created_at:
@@ -1411,18 +1110,8 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         client.create_backup(CONF.backup_proxmox_datastore,
                              backup_type, backup_id, backup_time)
 
-        # For fixed index, we need to know the total size upfront
-        # Calculate based on volume size, but this is the maximum size
-        # The actual size will be determined when we close the index
-        volume_size_bytes = backup.size * 1024 * 1024 * 1024  # GB to bytes
-
-        # Round up to nearest chunk size to ensure we have enough space
-        chunk_size = CONF.backup_proxmox_chunk_size
-        num_chunks = (volume_size_bytes + chunk_size - 1) // chunk_size
-        total_size = num_chunks * chunk_size
-
-        # Create the fixed index for volume data
-        wid = client.create_fixed_index("volume.fidx", total_size)
+        # Create the dynamic index for volume data
+        wid = client.create_dynamic_index("volume.didx")
 
         # Store client and state
         self._active_clients[backup.id] = client
@@ -1430,93 +1119,48 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             'wid': wid,
             'chunk_count': 0,
             'total_size': 0,
-            'current_offset': 0,
-            'digests': [],
-            'offsets': [],
             'csum': hashlib.sha256(),
-            'expected_total_size': total_size,  # Track what we told PBS
-            'backup_time': backup_time,  # Store for service_metadata
-            'backup_id': backup_id,  # Store PBS backup_id
+            'index_name': 'volume.didx'
         }
+        self._backup_manifests[backup.id] = {}
 
         return super(ProxmoxBackupDriver, self)._prepare_backup(backup)
 
     def _finalize_backup(self, backup, container, object_meta, object_sha256):
         """Finalize the backup."""
-        client = self._active_clients.get(backup.id)
-        state = self._backup_state.get(backup.id)
-
-        if client and state:
-            try:
-                # Append all chunks to the index
-                if state['digests'] and state['offsets']:
-                    client.append_index(
-                        state['digests'], state['offsets'], state['wid'])
-
-                # Close the fixed index
-                index_csum = state['csum'].hexdigest()
-                client.close_fixed_index(
-                    state['chunk_count'],
-                    index_csum,
-                    state['total_size'],
-                    state['wid']
-                )
-
-                # Upload manifest
-                client.upload_manifest(
-                    'volume.fidx',
-                    state['total_size'],
-                    index_csum
-                )
-
-                # Complete backup
-                client.complete_backup()
-
-                # Save service metadata for restore
-                # This is critical - we need the exact backup_time used
-                service_metadata = {
-                    'backup_id': state['backup_id'],
-                    'backup_time': state['backup_time'],
-                    'archive_name': 'volume.fidx',
-                    'backup_type': 'vm',
-                }
-                backup.service_metadata = json.dumps(service_metadata)
-                backup.save()
-
-                LOG.info("PBS backup completed successfully. "
-                         "Saved service_metadata: %s", service_metadata)
-            except Exception as e:
-                LOG.error(f"Error finishing PBS backup: {e}")
-                # Cleanup before re-raising
-                if backup.id in self._active_clients:
-                    del self._active_clients[backup.id]
-                if backup.id in self._backup_state:
-                    del self._backup_state[backup.id]
-                raise
-
-        # Now call parent's finalize - but mark that PBS is done
-        # so get_object_writer knows to handle metadata differently
-        if state:
-            state['pbs_finalized'] = True
-
         try:
             super(ProxmoxBackupDriver, self)._finalize_backup(backup, container,
                                                               object_meta, object_sha256)
         finally:
-            # Clean up session after parent finalization
-            if backup.id in self._active_clients:
-                del self._active_clients[backup.id]
-            if backup.id in self._backup_state:
-                del self._backup_state[backup.id]
-            # Note: We keep _backup_metadata[backup.id] for incremental backups
-            # It will be used when creating incremental backups that reference this one
-            # Clear current backup tracking
-            self._current_backup_id = None
+            client = self._active_clients.get(backup.id)
+            state = self._backup_state.get(backup.id)
+
+            if client and state:
+                try:
+                    # Upload manifest
+                    manifest = self._backup_manifests.get(backup.id, {})
+                    manifest_data = json.dumps(manifest).encode('utf-8')
+                    client.upload_blob("cinder-manifest.json", manifest_data)
+
+                    # Close whatever index is open
+                    client.close_dynamic_index(
+                        state['wid'],
+                        state['chunk_count'],
+                        state['total_size'],
+                        state['csum'].hexdigest()
+                    )
+                    client.finish_backup()
+                except Exception as e:
+                    LOG.error(f"Error finishing PBS backup: {e}")
+                finally:
+                    del self._active_clients[backup.id]
+                    del self._backup_state[backup.id]
+                    del self._backup_manifests[backup.id]
 
     def put_container(self, container):
-        """Create the datastore / namespace if needed.
+        """Create the datastore/namespace if needed.
 
-        : param container: Container name(datastore)
+        :param container: Container name (datastore)
         """
         # In PBS, datastores are pre-created via admin interface
         # Namespaces can be created via API if needed
@@ -1525,43 +1169,18 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     def get_container_entries(self, container, prefix):
         """Get backup entries in the datastore.
 
-        : param container: Container name(datastore)
-        : param prefix: Prefix for filtering backups
-        : returns: List of backup names
+        :param container: Container name (datastore)
+        :param prefix: Prefix for filtering backups
+        :returns: List of backup names
         """
         # Would query PBS API for backup snapshots
         # For now, return empty list
         LOG.debug(f"Listing backups in {container} with prefix {prefix}")
         return []
 
-    def _generate_object_name_prefix(self, backup):
-        """Generate object name prefix for backup.
-
-        : param backup: Backup object
-        : returns: Object name prefix
-        """
-        # Use backup ID as prefix for PBS backup objects
-        return f"backup_{backup.id}_"
-
-    def delete_object(self, container, object_name):
-        """Delete object from container.
-
-        : param container: Container name(datastore)
-        : param object_name: Object name to delete
-        """
-        # For PBS, objects are managed as part of backup snapshots
-        # Individual chunk deletion is handled by PBS garbage collection
-        # But we do need to handle the delete_backup call in the driver,
-        # which calls delete_snapshot.
-        pass
-
     def get_object_writer(self, container, object_name, extra_metadata=None):
         """Get a writer for uploading an object."""
-        # Try to get backup_id from extra_metadata, fall back to current backup
         backup_id = extra_metadata.get('backup_id') if extra_metadata else None
-        if not backup_id:
-            backup_id = self._current_backup_id
-
         client = self._active_clients.get(backup_id)
         state = self._backup_state.get(backup_id)
 
@@ -1737,9 +1356,9 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     def update_container_name(self, backup, container):
         """Update container name if needed.
 
-        : param backup: Backup object
-        : param container: Proposed container name
-        : returns: Updated container name or None
+        :param backup: Backup object
+        :param container: Proposed container name
+        :returns: Updated container name or None
         """
         # Use configured datastore
         return CONF.backup_proxmox_datastore
@@ -1772,155 +1391,11 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             msg = _("Failed to connect to Proxmox Backup Server: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
-    def restore(self, backup, volume_id, volume_file, volume_is_new):
-        """Restore metadata and volume data from PBS backup."""
-        # 1. Connect to PBS
-        client = self._get_client()
-        client.authenticate()
-
-        # Get backup metadata from service_metadata
-        if not backup.service_metadata:
-            msg = _("Backup has no service_metadata. Cannot restore - "
-                    "backup may have been created with an older driver version.")
-            LOG.error(msg)
-            raise exception.BackupDriverException(msg)
-
-        try:
-            meta = json.loads(backup.service_metadata)
-        except (json.JSONDecodeError, TypeError) as e:
-            msg = _("Invalid service_metadata format: %s") % str(e)
-            LOG.error(msg)
-            raise exception.BackupDriverException(msg)
-
-        backup_type = meta.get('backup_type', 'vm')
-        backup_id = meta.get('backup_id', f"volume-{backup.volume_id}")
-        backup_time = meta.get('backup_time')
-        archive_name = meta.get('archive_name', 'volume.fidx')
-
-        if not backup_time:
-            msg = _("Missing backup_time in service_metadata")
-            LOG.error(msg)
-            raise exception.BackupDriverException(msg)
-
-        LOG.info("Starting restore for %s (time: %s)", backup_id, backup_time)
-
-        try:
-            # 2. Start restore session
-            client.create_restore(CONF.backup_proxmox_datastore,
-                                  backup_type, backup_id, backup_time)
-
-            # 3. Download manifest to get actual data size
-            manifest = client.download_manifest()
-            files = manifest.get('files', [])
-            if not files:
-                raise exception.BackupDriverException(
-                    "No files found in backup manifest")
-
-            # Get the actual size (without padding)
-            actual_size = files[0].get('size', 0)
-            LOG.info(f"Actual backup data size: {actual_size} bytes")
-
-            # 4. Download Index (using archive_name from service_metadata)
-            chunk_digests = client.download_index(archive_name)
-            LOG.info(f"Downloaded index with {len(chunk_digests)} chunks")
-
-            # 5. Calculate chunk size and how much to write
-            chunk_size = CONF.backup_proxmox_chunk_size
-            total_written = 0
-            chunk_reader = PBSChunkReader(client)
-
-            # 6. Download and write chunks
-            for i, digest in enumerate(chunk_digests):
-                chunk_data = chunk_reader.read_chunk(digest)
-
-                # Calculate how much of this chunk to actually write
-                remaining = actual_size - total_written
-                bytes_to_write = min(len(chunk_data), remaining)
-
-                if bytes_to_write > 0:
-                    # Only write the actual data, not the padding
-                    volume_file.write(chunk_data[:bytes_to_write])
-                    total_written += bytes_to_write
-
-                # Progress logging
-                if i > 0 and i % 100 == 0:
-                    progress = (total_written / actual_size *
-                                100) if actual_size > 0 else 0
-                    LOG.debug(f"Restored {i} / {len(chunk_digests)} chunks "
-                              f"({progress:.1f}% complete)")
-
-                # Stop if we've written all the data
-                if total_written >= actual_size:
-                    break
-
-            LOG.info(
-                f"Restore completed successfully. Wrote {total_written} bytes")
-
-        except Exception as e:
-            LOG.error(f"Restore failed: {e}")
-            raise
-        finally:
-            if client.sock:
-                client.sock.close()
-
-    def delete_backup(self, backup):
-        """Delete backup from PBS.
-
-        This method is called when a backup is deleted from OpenStack dashboard.
-        It removes the backup snapshot from Proxmox Backup Server using the
-        exact backup_time that was stored during backup creation.
-
-        :param backup: Backup object to delete
-        """
-        # Extract PBS backup information from service_metadata
-        if not backup.service_metadata:
-            LOG.warning("No service_metadata found for backup %s, "
-                        "cannot delete from PBS", backup.id)
-            return
-
-        try:
-            service_metadata = json.loads(backup.service_metadata)
-        except (json.JSONDecodeError, TypeError) as e:
-            LOG.error("Failed to parse service_metadata for backup %s: %s",
-                      backup.id, str(e))
-            return
-
-        # Get PBS connection details from metadata
-        backup_id = service_metadata.get('backup_id')
-        backup_time = service_metadata.get('backup_time')
-        backup_type = service_metadata.get('backup_type', 'vm')
-
-        if not backup_id or not backup_time:
-            LOG.warning("Missing backup_id or backup_time in service_metadata "
-                        "for backup %s", backup.id)
-            return
-
-        LOG.info("Deleting backup from PBS: %s (time: %s)",
-                 backup_id, backup_time)
-
-        # Create PBS client and authenticate
-        client = self._get_client()
-        client.authenticate()
-
-        # Delete the snapshot from PBS using the exact backup_time from metadata
-        try:
-            client.delete_snapshot(
-                CONF.backup_proxmox_datastore,
-                backup_type,
-                backup_id,
-                backup_time
-            )
-            LOG.info("Successfully deleted backup %s from PBS", backup.id)
-        except exception.BackupDriverException as e:
-            LOG.error("Failed to delete backup %s from PBS: %s",
-                      backup.id, str(e))
-            raise
-
 
 def get_backup_driver(context):
     """Return a Proxmox Backup driver instance.
 
-    : param context: Security context
-    : returns: ProxmoxBackupDriver instance
+    :param context: Security context
+    :returns: ProxmoxBackupDriver instance
     """
     return ProxmoxBackupDriver(context)
