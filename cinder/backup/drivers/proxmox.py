@@ -1044,11 +1044,14 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
                 # Save service metadata for restore
                 # This is critical - we need the exact backup_time used
+                # Also store original volume size for proper truncation on restore
+                volume_size_bytes = backup.size * 1024 * 1024 * 1024  # GB to bytes
                 service_metadata = {
                     'backup_id': state['backup_id'],
                     'backup_time': state['backup_time'],
                     'archive_name': 'volume.fidx',
                     'backup_type': 'vm',
+                    'volume_size_bytes': volume_size_bytes,
                 }
                 backup.service_metadata = json.dumps(service_metadata)
                 backup.save()
@@ -1293,6 +1296,19 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 # Progress logging every 10% or so could be added here
                 if i > 0 and i % 100 == 0:
                     LOG.debug(f"Restored {i} / {len(chunk_digests)} chunks")
+
+            # 5. Truncate to original volume size
+            # Chunks are padded to chunk_size during backup, so the restored
+            # data may be larger than the original volume. Truncate to the
+            # exact original size to ensure proper disk geometry and boot.
+            volume_size_bytes = meta.get('volume_size_bytes')
+            if volume_size_bytes:
+                volume_file.truncate(volume_size_bytes)
+                LOG.info(f"Truncated volume to original size: {volume_size_bytes} bytes")
+            else:
+                # Fallback for backups created before this fix
+                LOG.warning("volume_size_bytes not found in service_metadata, "
+                            "skipping truncation. This may cause boot issues.")
 
             LOG.info("Restore completed successfully")
 
