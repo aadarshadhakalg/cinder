@@ -1287,28 +1287,39 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             LOG.info(f"Downloaded index with {len(chunk_digests)} chunks")
 
             # 4. Download and write chunks
+            # Track bytes written to avoid writing beyond original volume size.
+            # This is critical for block devices where truncate() doesn't work.
             chunk_reader = PBSChunkReader(client)
+            volume_size_bytes = meta.get('volume_size_bytes')
+            bytes_written = 0
 
             for i, digest in enumerate(chunk_digests):
                 data = chunk_reader.read_chunk(digest)
+
+                # If we know the original size, don't write beyond it
+                # (last chunk may be padded)
+                if volume_size_bytes:
+                    remaining = volume_size_bytes - bytes_written
+                    if remaining <= 0:
+                        LOG.debug("Reached original volume size, stopping write")
+                        break
+                    if len(data) > remaining:
+                        data = data[:remaining]
+                        LOG.debug(f"Trimming last chunk to {remaining} bytes")
+
                 volume_file.write(data)
+                bytes_written += len(data)
 
                 # Progress logging every 10% or so could be added here
                 if i > 0 and i % 100 == 0:
                     LOG.debug(f"Restored {i} / {len(chunk_digests)} chunks")
 
-            # 5. Truncate to original volume size
-            # Chunks are padded to chunk_size during backup, so the restored
-            # data may be larger than the original volume. Truncate to the
-            # exact original size to ensure proper disk geometry and boot.
-            volume_size_bytes = meta.get('volume_size_bytes')
             if volume_size_bytes:
-                volume_file.truncate(volume_size_bytes)
-                LOG.info(f"Truncated volume to original size: {volume_size_bytes} bytes")
+                LOG.info(f"Restored {bytes_written} bytes (original size: {volume_size_bytes})")
             else:
-                # Fallback for backups created before this fix
+                # Fallback for backups created before volume_size_bytes was stored
                 LOG.warning("volume_size_bytes not found in service_metadata, "
-                            "skipping truncation. This may cause boot issues.")
+                            "wrote all chunk data. This may cause boot issues.")
 
             LOG.info("Restore completed successfully")
 
