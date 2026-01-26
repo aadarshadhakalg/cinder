@@ -43,7 +43,6 @@ from urllib import parse as urlparse
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import timeutils
-import requests
 import httpx
 import h2.connection
 import h2.config
@@ -725,17 +724,11 @@ class ObjectWriter:
             original_size = chunk_size
 
             # Check if this is smaller than the fixed chunk size
+            # For fixed index, the last chunk can be smaller than the fixed size.
+            # We should not pad it, as that changes the image size and can corrupt
+            # partition tables (e.g. GPT backup header location).
             if chunk_size < self.fixed_chunk_size:
-                # Pad with zeros to make it a full chunk
-                # PBS will track the actual data size separately
-                padding = b'\x00' * (self.fixed_chunk_size - chunk_size)
-                data = data + padding
-                chunk_size = self.fixed_chunk_size
-
-                from oslo_log import log as logging
-                LOG = logging.getLogger(__name__)
-                LOG.debug(
-                    f"Padded chunk from {original_size} to {chunk_size} bytes")
+                LOG.debug(f"Uploading partial chunk of size {chunk_size} bytes")
 
             # Wrap chunk in blob format
             chunk_data = self.chunk_handler.encode(data)
