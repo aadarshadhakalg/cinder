@@ -693,6 +693,7 @@ class ObjectWriter:
         self.chunk_handler = PBSChunk()
         self.buffer = io.BytesIO()
         self.state = state
+        self.volume_size_bytes = state.get('volume_size_bytes') if state else None
         # Get the fixed chunk size from config (default 4MB)
         from oslo_config import cfg
         self.fixed_chunk_size = cfg.CONF.backup_proxmox_chunk_size
@@ -724,11 +725,26 @@ class ObjectWriter:
             original_size = chunk_size
 
             # Check if this is smaller than the fixed chunk size
-            # For fixed index, the last chunk can be smaller than the fixed size.
-            # We should not pad it, as that changes the image size and can corrupt
-            # partition tables (e.g. GPT backup header location).
+            # PBS requires all chunks except the last one to be exactly fixed_chunk_size.
+            # If we encounter a small chunk that is NOT the last chunk of the volume,
+            # we MUST pad it to preserve alignment and prevent "multiple end chunks" error.
+            # However, we must NOT pad the actual last chunk, as that extends the disk size.
             if chunk_size < self.fixed_chunk_size:
-                LOG.debug(f"Uploading partial chunk of size {chunk_size} bytes")
+                is_last_chunk = False
+                if self.volume_size_bytes:
+                    current_offset = self.state['current_offset']
+                    if current_offset + chunk_size >= self.volume_size_bytes:
+                        is_last_chunk = True
+
+                if is_last_chunk:
+                    LOG.debug(f"Uploading partial LAST chunk of size {chunk_size} bytes")
+                else:
+                    # Not the last chunk (or unknown volume size), so we must pad
+                    padding = b'\x00' * (self.fixed_chunk_size - chunk_size)
+                    data = data + padding
+                    chunk_size = self.fixed_chunk_size
+                    LOG.debug(
+                        f"Padded MIDDLE chunk from {original_size} to {chunk_size} bytes to maintain alignment")
 
             # Wrap chunk in blob format
             chunk_data = self.chunk_handler.encode(data)
@@ -1142,6 +1158,11 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             return MetadataWriter(self, backup_id, object_name)
 
         # For volume data chunks, use ObjectWriter
+        # Ensure state has volume_size_bytes if possible
+        if state and 'volume_size_bytes' not in state and extra_metadata:
+            if 'volume_size' in extra_metadata:
+                state['volume_size_bytes'] = int(extra_metadata['volume_size']) * 1024 * 1024 * 1024
+
         return ObjectWriter(client, container, object_name, state=state)
 
     def get_object_reader(self, container, object_name, extra_metadata=None):
