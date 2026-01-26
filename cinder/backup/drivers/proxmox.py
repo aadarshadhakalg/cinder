@@ -1265,10 +1265,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                         i += 1
 
                     data = base64.b64decode(b64_data)
-                    return MetadataReader(data)
-            except Exception as e:
-                LOG.warning(f"Failed to load metadata from database: {e}")
-                        f"Retrieved metadata {object_name} from database for backup {backup_id}")
+                    LOG.debug(f"Retrieved metadata {object_name} from database for backup {backup_id}")
                     return MetadataReader(data)
             except Exception as e:
                 LOG.warning(f"Failed to load metadata from database: {e}")
