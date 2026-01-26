@@ -579,6 +579,56 @@ class PBSClient:
             msg = _("Failed to upload manifest: %s") % str(e)
             raise exception.BackupDriverException(msg)
 
+    def upload_blob(self, filename, data):
+        """Upload a raw blob file to the backup snapshot.
+
+        :param filename: Name of the file (e.g. 'volume_metadata')
+        :param data: Raw bytes of the file
+        """
+        # Wrap in blob format (uncompressed)
+        chunk_handler = PBSChunk()
+        # Create a simple blob
+        blob = chunk_handler.encode(data)
+
+        path = "/blob"
+        params = {
+            'file-name': filename,
+            'encoded-size': len(blob),
+        }
+
+        try:
+            self._h2_request('POST', path, params=params, body=blob)
+            LOG.debug(f"Uploaded blob {filename} ({len(data)} bytes)")
+        except Exception as e:
+            msg = _("Failed to upload blob %s: %s") % (filename, str(e))
+            raise exception.BackupDriverException(msg)
+
+    def download_blob(self, filename):
+        """Download a raw blob file from the backup snapshot.
+
+        :param filename: Name of the file
+        :returns: Raw bytes of the file
+        """
+        path = '/download'
+        params = {'file-name': filename}
+
+        try:
+            headers, data = self._h2_request('GET', path, params=params)
+            
+            chunk_handler = PBSChunk()
+            try:
+                # Try to decode as PBS blob
+                return chunk_handler.decode(data)
+            except ValueError:
+                # If decode fails (e.g. not a blob, or raw), return as is?
+                # PBS /download typically returns exactly what was stored.
+                return data
+                
+        except Exception as e:
+            # If not found or error
+            LOG.warning(f"Failed to download blob {filename}: {e}")
+            return None
+
     def download_index(self, archive_name):
         """Download and parse the fixed index file.
 
@@ -774,11 +824,10 @@ class ObjectWriter:
 
 
 class MetadataWriter:
-    """Writer for metadata files that persists data in backup object's metadata.
+    """Writer for metadata files that persists data in PBS blobs.
 
-    PBS manages its own metadata (index.json.blob), but Cinder needs
-    SHA256 files for incremental backups. We store these in the backup
-    object's metadata field in the database for persistence.
+    Cinder needs SHA256 files for incremental backups. We store these as
+    raw blobs in the Proxmox Backup Server snapshot.
     """
 
     def __init__(self, driver, backup_id, object_name):
@@ -800,62 +849,43 @@ class MetadataWriter:
         self.buffer.write(data)
 
     def close(self):
-        """Persist metadata to database via backup object."""
-        from cinder import db
-        from cinder import context as cinder_context
-
+        """Persist metadata to PBS as a blob file."""
         data = self.buffer.getvalue()
-
-        # Also keep in memory cache for current session
-        if not hasattr(self.driver, '_pbs_metadata_cache'):
-            self.driver._pbs_metadata_cache = {}
-        if self.backup_id not in self.driver._pbs_metadata_cache:
-            self.driver._pbs_metadata_cache[self.backup_id] = {}
-        self.driver._pbs_metadata_cache[self.backup_id][self.object_name] = data
-
-        # Persist to database
+        
+        # Determine a filename for the blob
+        # object_name is typically 'volume_metadata' or 'sha256file'
+        filename = f"{self.object_name}.blob"
+        
         try:
-            # Get admin context to update backup metadata
-            ctxt = cinder_context.get_admin_context()
-            backup = db.backup_get(ctxt, self.backup_id)
+            # We need the active client for this backup_id
+            if not self.driver or not hasattr(self.driver, '_active_clients'):
+                 # Should not happen in normal flow
+                 raise exception.BackupDriverException("Driver not available for metadata upload")
+            
+            client = self.driver._active_clients.get(self.backup_id)
+            if not client:
+                 # Check if we can find it in backup_session cache logic
+                 # But MetadataWriter is created when pbs_finalized is True.
+                 # Actually, we need to ensure the session is still open?
+                 # If ChunkedBackupDriver calls write metadata AFTER session close?
+                 # No, ProxmoxDriver must allow writing blobs.
+                 # But our session is Open.
+                 raise exception.BackupDriverException(f"No active PBS client for {self.backup_id}")
 
-            # Get existing metadata or create new dict
-            metadata = backup.get('metadata') or {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-
-            # Store the file data as base64 encoded string
-            import base64
-            b64_data = base64.b64encode(data).decode('utf-8')
-
-            # Split into 60KB chunks to fit in DB column
-            chunk_size = 60000
-            chunks = [b64_data[i:i + chunk_size]
-                      for i in range(0, len(b64_data), chunk_size)]
-
-            # Store chunks
-            if chunks:
-                metadata[f'pbs_meta_{self.object_name}'] = chunks[0]
-                for i in range(1, len(chunks)):
-                    metadata[f'pbs_meta_{self.object_name}_{i}'] = chunks[i]
-            else:
-                metadata[f'pbs_meta_{self.object_name}'] = ""
-
-            # Update backup with new metadata
-            db.backup_metadata_update(ctxt, self.backup_id, metadata, False)
-
-            LOG.debug(f"Persisted metadata {self.object_name} ({len(data)} bytes) "
-                      f"to database for backup {self.backup_id}")
+            client.upload_blob(filename, data)
+            LOG.debug(f"Uploaded metadata {filename} to PBS")
+            
         except Exception as e:
-            LOG.warning(f"Failed to persist metadata to database: {e}")
-            # Continue - we still have it in memory cache for this session
+            LOG.error(f"Failed to upload metadata {filename}: {e}")
+            raise
+
 
 
 class MetadataReader:
     """Reader for metadata files stored in backup metadata."""
 
     def __init__(self, data):
-        self.data = data
+        self.buffer = io.BytesIO(data)
 
     def __enter__(self):
         return self
@@ -863,9 +893,9 @@ class MetadataReader:
     def __exit__(self, exc_type, exc_val, exc_tb):
         return False
 
-    def read(self):
+    def read(self, *args, **kwargs):
         """Return the stored metadata."""
-        return self.data
+        return self.buffer.read(*args, **kwargs)
 
 
 class ObjectReader:
@@ -1182,7 +1212,41 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                         f"Retrieved metadata {object_name} from cache for backup {backup_id}")
                     return MetadataReader(metadata_dict[object_name])
 
-            # Try to load from database
+            # Load from PBS directly
+            client = self._get_client()
+            try:
+                client.authenticate()
+                
+                # We must establish a restore session to use H2/download
+                ctxt = cinder_context.get_admin_context()
+                backup = db.backup_get(ctxt, backup_id)
+                if backup.service_metadata:
+                    meta = json.loads(backup.service_metadata)
+                    # Use defaults if keys missing (legacy compatible)
+                    # Note: create_restore requires these.
+                    client.create_restore(
+                        CONF.backup_proxmox_datastore,
+                        meta.get('backup_type', 'vm'),
+                        meta.get('backup_id', f"volume-{backup.volume_id}"),
+                        meta.get('backup_time')
+                    )
+                
+                    filename = f"{object_name}.blob"
+                    data = client.download_blob(filename)
+                    
+                    if data:
+                        # Cache it
+                        if not hasattr(self, '_pbs_metadata_cache'):
+                            self._pbs_metadata_cache = {}
+                        if backup_id not in self._pbs_metadata_cache:
+                            self._pbs_metadata_cache[backup_id] = {}
+                        self._pbs_metadata_cache[backup_id][object_name] = data
+                        
+                        return MetadataReader(data)
+            except Exception as e:
+                LOG.warning(f"Failed to load metadata blob {object_name} from PBS: {e}")
+
+            # Fallback: Try to load from database (legacy support for old backups)
             try:
                 ctxt = cinder_context.get_admin_context()
                 backup = db.backup_get(ctxt, backup_id)
@@ -1201,15 +1265,9 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                         i += 1
 
                     data = base64.b64decode(b64_data)
-
-                    # Cache it for future use
-                    if not hasattr(self, '_pbs_metadata_cache'):
-                        self._pbs_metadata_cache = {}
-                    if backup_id not in self._pbs_metadata_cache:
-                        self._pbs_metadata_cache[backup_id] = {}
-                    self._pbs_metadata_cache[backup_id][object_name] = data
-
-                    LOG.debug(
+                    return MetadataReader(data)
+            except Exception as e:
+                LOG.warning(f"Failed to load metadata from database: {e}")
                         f"Retrieved metadata {object_name} from database for backup {backup_id}")
                     return MetadataReader(data)
             except Exception as e:
