@@ -1071,19 +1071,15 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                     state['wid']
                 )
 
-                # Upload manifest
+                # Upload manifest (required before complete_backup)
                 client.upload_manifest(
                     'volume.fidx',
                     state['total_size'],
                     index_csum
                 )
 
-                # Complete backup
-                client.complete_backup()
-
-                # Save service metadata for restore
-                # This is critical - we need the exact backup_time used
-                # Also store original volume size for proper truncation on restore
+                # Save service metadata for restore BEFORE completing backup
+                # (needed for metadata blob filenames)
                 volume_size_bytes = backup.size * 1024 * 1024 * 1024  # GB to bytes
                 service_metadata = {
                     'backup_id': state['backup_id'],
@@ -1095,35 +1091,33 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
                 backup.service_metadata = json.dumps(service_metadata)
                 backup.save()
 
+                LOG.info("Completed PBS backup session")
+
+                # Mark PBS as ready for metadata uploads
+                # (session still open, can upload blobs)
+                state['pbs_finalized'] = True
+
+                # Call parent's finalize - this writes sha256file via MetadataWriter
+                # The session is still open, so upload_blob will work
+                super(ProxmoxBackupDriver, self)._finalize_backup(
+                    backup, container, object_meta, object_sha256)
+
+                # NOW complete the backup (closes the session)
+                client.complete_backup()
+
                 LOG.info("PBS backup completed successfully. "
                          "Saved service_metadata: %s", service_metadata)
+
             except Exception as e:
                 LOG.error(f"Error finishing PBS backup: {e}")
-                # Cleanup before re-raising
+                raise
+            finally:
+                # Clean up session state
                 if backup.id in self._active_clients:
                     del self._active_clients[backup.id]
                 if backup.id in self._backup_state:
                     del self._backup_state[backup.id]
-                raise
-
-        # Now call parent's finalize - but mark that PBS is done
-        # so get_object_writer knows to handle metadata differently
-        if state:
-            state['pbs_finalized'] = True
-
-        try:
-            super(ProxmoxBackupDriver, self)._finalize_backup(backup, container,
-                                                              object_meta, object_sha256)
-        finally:
-            # Clean up session after parent finalization
-            if backup.id in self._active_clients:
-                del self._active_clients[backup.id]
-            if backup.id in self._backup_state:
-                del self._backup_state[backup.id]
-            # Note: We keep _backup_metadata[backup.id] for incremental backups
-            # It will be used when creating incremental backups that reference this one
-            # Clear current backup tracking
-            self._current_backup_id = None
+                self._current_backup_id = None
 
     def put_container(self, container):
         """Create the datastore / namespace if needed.
