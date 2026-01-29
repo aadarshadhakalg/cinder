@@ -100,17 +100,17 @@ class FixedIndex:
         # Header layout:
         # Magic [8], UUID [16], Ctime [8], IndexCsum [32], Size [8], ChunkSize [8], Reserved [...]
         
-        current.offset = FixedIndex.HEADER_SIZE
+        offset = FixedIndex.HEADER_SIZE
         digests = []
         
         # Digest is 32 bytes (SHA256)
-        while current.offset + 32 <= len(data):
-            digest = data[current.offset:current.offset + 32]
+        while offset + 32 <= len(data):
+            digest = data[offset:offset + 32]
             # Check for zero-padding (end of index rules?)
             # Actually PBS fixed index is size-defined.
             # But we can just read all available 32-byte blocks.
             digests.append(digest.hex())
-            current.offset += 32
+            offset += 32
             
         return digests
 
