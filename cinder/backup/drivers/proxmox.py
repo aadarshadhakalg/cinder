@@ -64,7 +64,7 @@ CONF = cfg.CONF
 CONF.register_opts(proxmoxbackup_service_opts)
 
 
-@interface.backup_driver
+@interface.backupdriver
 class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
     """Provides backup, restore and delete of backup volume within PBS."""
 
