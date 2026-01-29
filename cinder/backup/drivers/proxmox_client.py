@@ -382,3 +382,30 @@ class PBSClient:
         data = self._h2_request('GET', '/chunk', params={'digest': digest})
         # Important: Decode blob to get actual data
         return PBSBlob.decode(data)
+
+    def delete_snapshot(self, backup_type, backup_id, backup_time):
+        """Delete a backup snapshot."""
+        if not self.ticket:
+            self.login()
+
+        url = f"{self.base_url}/api2/json/admin/datastore/{self.datastore}/snapshots"
+        
+        headers = {
+            'CSRFPreventionToken': self.csrf_token,
+            'Cookie': f"PBSAuthCookie={self.ticket}"
+        }
+        
+        params = {
+            'backup-type': backup_type,
+            'backup-id': backup_id,
+            'backup-time': int(backup_time)
+        }
+        
+        try:
+            resp = self.auth_client.delete(url, headers=headers, params=params)
+            resp.raise_for_status()
+            LOG.info(f"Successfully deleted snapshot {backup_type}/{backup_id}/{backup_time}")
+        except Exception as e:
+            msg = _("Failed to delete snapshot: %s") % str(e)
+            LOG.error(msg)
+            raise exception.BackupDriverException(msg)

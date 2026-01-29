@@ -114,8 +114,42 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def delete_backup(self, backup):
         """Delete backup from PBS."""
-        # TODO: Implement deletion (require API call to delete /datastore/name/snapshot)
+        # 1. Prepare Metadata
+        try:
+            meta = json.loads(backup.service_metadata)
+            backup_type = meta['backup_type']
+            backup_id = meta['backup_id']
+            backup_time = meta['backup_time']
+        except (ValueError, TypeError, KeyError):
+            # If we can't parse metadata, we can't reliably delete from PBS.
+            # But we should clear the Cinder record.
+            LOG.warning(f"Could not parse service_metadata for backup {backup.id}. Skipping PBS deletion.")
+            return
+
+        # 2. Check/Delete
+        try:
+            self.pbs_client.delete_snapshot(backup_type, backup_id, backup_time)
+        except Exception as e:
+            LOG.error(f"Failed to delete backup from PBS: {e}")
+            raise
+
+    def delete_object(self, container, object_name):
+        """Delete object from container."""
+        # Not used in PBS driver as we manage snapshots/chunks differently.
+        # But must be implemented as it's abstract.
         pass
+
+    def _generate_object_name_prefix(self, backup):
+        """Generates a prefix for the object's name."""
+        return backup.id
+
+    def update_container_name(self, backup, container):
+        """Allow sub-classes to override container name."""
+        return container
+
+    def get_extra_metadata(self, backup, volume):
+        """Return extra metadata to use in prepare_backup."""
+        return {}
 
     def check_for_setup_error(self):
         if not CONF.backup_proxmox_host:
