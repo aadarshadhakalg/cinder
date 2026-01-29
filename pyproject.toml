@@ -143,6 +143,10 @@ linstor = [
 quobyte = [
     "psutil>=5.7.2", # BSD
 ]
+proxmox = [
+    "h2>=4.0.0", # MIT
+    "httpx>=0.18.0", # BSD
+]
 
 [tool.setuptools]
 packages = [
