@@ -268,7 +268,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         
         LOG.info("Backup complete.")
 
-    def restore(self, backup, volume_id, volume_file):
+    def restore(self, backup, volume_id, volume_file, volume_is_new):
         """Restore volume from PBS."""
         meta = json.loads(backup.service_metadata)
         backup_type = meta['backup_type']
