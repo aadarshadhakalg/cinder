@@ -343,13 +343,13 @@ class PBSClient:
         }
         self._h2_request('POST', '/fixed_close', params=params)
 
-    def upload_fixed_chunk(self, wid, data, digest):
+    def upload_fixed_chunk(self, wid, data, digest, raw_size):
         """Upload a single chunk (if server needs it)."""
         # Note: data must be already encoded/encrypted as a Blob if needed.
         params = {
             'wid': int(wid),
             'digest': digest,
-            'size': len(data),
+            'size': int(raw_size),
             'encoded-size': len(data)
         }
         self._h2_request('POST', '/fixed_chunk', params=params, body=data)

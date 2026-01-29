@@ -213,7 +213,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             all_digests.extend(digest_bytes)
             
             # Upload Chunk (passing the blob)
-            self.pbs_client.upload_fixed_chunk(wid, blob, digest)
+            self.pbs_client.upload_fixed_chunk(wid, blob, digest, len(data))
             
             digests.append(digest)
             offsets.append(current_offset)
