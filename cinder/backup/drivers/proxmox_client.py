@@ -195,8 +195,11 @@ class PBSClient:
             f"backup-type={backup_type}",
             f"backup-id={backup_id}",
             f"backup-time={int(backup_time)}",
-            "benchmark=false"
         ]
+        
+        if mode == 'backup':
+            params.append("benchmark=false")
+
         if mode == 'restore':
             params.append("debug=true")
             
