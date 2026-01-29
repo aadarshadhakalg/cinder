@@ -345,16 +345,14 @@ class PBSClient:
 
     def upload_fixed_chunk(self, wid, data, digest):
         """Upload a single chunk (if server needs it)."""
-        # Note: For fixed index, we might not always upload if deduped.
-        # But this method strictly performs the upload action.
-        blob = PBSBlob.encode(data)
+        # Note: data must be already encoded/encrypted as a Blob if needed.
         params = {
             'wid': int(wid),
             'digest': digest,
             'size': len(data),
-            'encoded-size': len(blob)
+            'encoded-size': len(data)
         }
-        self._h2_request('POST', '/fixed_chunk', params=params, body=blob)
+        self._h2_request('POST', '/fixed_chunk', params=params, body=data)
 
     def upload_blob(self, filename, data):
         """Upload a generic blob file (like index.json)."""

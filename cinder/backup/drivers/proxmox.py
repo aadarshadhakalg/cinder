@@ -30,7 +30,7 @@ from cinder.backup import chunkeddriver
 from cinder import exception
 from cinder.i18n import _
 from cinder import interface
-from cinder.backup.drivers.proxmox_client import PBSClient, FixedIndex
+from cinder.backup.drivers.proxmox_client import PBSClient, FixedIndex, PBSBlob
 
 LOG = logging.getLogger(__name__)
 
@@ -197,29 +197,31 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             # PBS fixed index expects aligned chunks. The last chunk is allowed to be smaller.
             # But strict alignment for middle chunks is required.
             
-            # Calculate Digest (SHA256)
+            # Pad last chunk if needed?
+            # PBS fixed index chunking doesn't strictly require padding for the last chunk.
+
+            # Encode data to PBS Blob
+            blob = PBSBlob.encode(data)
+            
+            # Calculate Digest of the BLOB (not raw data)
             hasher = hashlib.sha256()
-            hasher.update(data)
+            hasher.update(blob)
             digest_bytes = hasher.digest()
             digest = hasher.hexdigest()
             
+            # Index check sum tracks the digest list (of blobs)
             all_digests.extend(digest_bytes)
             
-            # Upload Chunk
-            # Start with Optimistic approach: server handles dedup (if we upload, it just checks exists)
-            # Actually PBS protocol expects us to POST /fixed_chunk. 
-            # Server returns dedup status? API Docs say just upload.
-            self.pbs_client.upload_fixed_chunk(wid, data, digest)
+            # Upload Chunk (passing the blob)
+            self.pbs_client.upload_fixed_chunk(wid, blob, digest)
             
             digests.append(digest)
             offsets.append(current_offset)
             
-            current_offset += len(data)
+            current_offset += len(data) # Offset is still based on RAW volume size
             chunk_count += 1
             
-            # Append to index periodically or at end?
-            # It's better to do in batches to save memory on large volumes, 
-            # but for simplicity/safety we can do big batch append at end or chunks of 1000.
+            # Append to index periodically
             if len(digests) >= 1000:
                 self.pbs_client.append_fixed_index(wid, digests, offsets)
                 digests = []
