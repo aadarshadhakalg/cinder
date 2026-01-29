@@ -183,7 +183,7 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
         current_offset = 0
         
         chunk_count = 0
-        zero_chunk_retry_hack = False 
+        all_digests = bytearray()
         
         # We read from volume_file
         # Note: In Cinder, volume_file is a file-like object (e.g. /dev/nbd0 or a pipe)
@@ -200,7 +200,10 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             # Calculate Digest (SHA256)
             hasher = hashlib.sha256()
             hasher.update(data)
+            digest_bytes = hasher.digest()
             digest = hasher.hexdigest()
+            
+            all_digests.extend(digest_bytes)
             
             # Upload Chunk
             # Start with Optimistic approach: server handles dedup (if we upload, it just checks exists)
@@ -227,26 +230,9 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             self.pbs_client.append_fixed_index(wid, digests, offsets)
             
         # 5. Close Fixed Index
-        index_csum = "0" * 64 # TODO: Calculate actual index checksum? PBS requires it?
-        # Actually PBS server calculates it usually. 
-        # But API close params require it. 
-        # In this first pass, we might need to calculate it if PBS validates strict client-side csum.
-        # Let's try 0s or look at client validation.
-        # FixedIndex header csum covers all digests. 
-        # For now, let's see if we can get away without it or calculate it properly.
-        # Calculation: SHA256 of the entire .fidx body (chunks of 32-byte digests).
+        index_csum = hashlib.sha256(all_digests).hexdigest()
         
-        # Re-calculating full index csum client side:
-        # We need all digests. If we flushed them, we didn't save them.
-        # To be safe, let's keep all digests in a separate list or file for csum calc if memory permits 
-        # (1TB volume @ 4MB chunks = 250k digests * 32 bytes = ~8MB RAM. Safe).
-        
-        # Refactoring to keep all digests for CSUM
-        # (Wait, appends flushed them to server. We just track them for CSUM)
-        # Actually, let's just use the final count/size invocation.
-        # If strict check fails, we will implement full CSUM.
-        
-        self.pbs_client.close_fixed_index(wid, chunk_count, volume_size, index_csum) # Try dummy csum first
+        self.pbs_client.close_fixed_index(wid, chunk_count, volume_size, index_csum)
         
         # 6. Upload Manifest (index.json)
         manifest_data = {
