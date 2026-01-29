@@ -203,9 +203,9 @@ class ProxmoxBackupDriver(chunkeddriver.ChunkedBackupDriver):
             # Encode data to PBS Blob
             blob = PBSBlob.encode(data)
             
-            # Calculate Digest of the BLOB (not raw data)
+            # Calculate Digest of the RAW data (consistent with PBS protocol for fixed chunks)
             hasher = hashlib.sha256()
-            hasher.update(blob)
+            hasher.update(data)
             digest_bytes = hasher.digest()
             digest = hasher.hexdigest()
             
